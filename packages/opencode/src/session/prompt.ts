@@ -49,12 +49,18 @@ import { SessionRunState } from "./run-state"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { DelegationStore } from "@opencode-ai/core/delegation"
+import { DelegationGenerationTable, DelegationRevocationTable } from "@opencode-ai/core/delegation/sql"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
-import { eq } from "drizzle-orm"
+import { Delegation } from "@opencode-ai/schema/delegation"
+import { and, eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
+import { SessionDelegation } from "./delegation"
+import { SessionDelegationDelivery } from "./delegation-delivery"
+import { SessionDelegationTurn } from "./delegation-turn"
 import { LLMEvent } from "@opencode-ai/llm"
 
 // @ts-ignore
@@ -62,6 +68,12 @@ globalThis.AI_SDK_LOG_WARNINGS = false
 
 const decodeMessageInfo = Schema.decodeUnknownExit(SessionV1.Info)
 const decodeMessagePart = Schema.decodeUnknownExit(SessionV1.Part)
+const HistoryCutoff = Schema.Struct({
+  messages: Schema.Array(Schema.String),
+  work: Schema.Array(Delegation.WorkID),
+})
+const decodeHistoryCutoffJson = Schema.decodeUnknownOption(Schema.UnknownFromJsonString)
+const decodeHistoryCutoff = Schema.decodeUnknownOption(HistoryCutoff)
 const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "application/pdf",
@@ -99,8 +111,15 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+type Admission = {
+  readonly generation: Delegation.Generation
+  readonly workID: Delegation.WorkID
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly wake: (sessionID: SessionID) => Effect.Effect<void>
+  readonly recover: () => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
@@ -140,12 +159,17 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const core = yield* DelegationStore.Service
+    const adapter = yield* SessionDelegation.Service
+    const delivery = yield* SessionDelegationDelivery.Service
+    const turn = yield* SessionDelegationTurn.Service
     const { db } = database
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
-        cancel: (sessionID: SessionID) => cancel(sessionID),
+        cancel: (sessionID: SessionID) => state.cancelFromTask(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
-        prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        prompt: (input: PromptInput, admission?: Admission) => prompt(input, admission).pipe(Effect.catch(Effect.die)),
+        wake: (sessionID: SessionID) => wake(sessionID),
       } satisfies TaskPromptOps
     })
 
@@ -1049,26 +1073,54 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
-      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input)
-      yield* sessions.touch(input.sessionID)
+    const prompt: (input: PromptInput, admission?: Admission) => Effect.Effect<SessionV1.WithParts, Image.Error> =
+      Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput, admission?: Admission) {
+        const messageID = input.messageID ?? MessageID.ascending()
+        const promptInput = input.messageID === undefined ? { ...input, messageID } : input
+        const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+        if (admission === undefined) {
+          yield* state.awaitCancellation(input.sessionID)
+          yield* core.allowSession(input.sessionID).pipe(Effect.orDie)
+        }
+        const receipt = yield* turn.input(input.sessionID, messageID, admission).pipe(Effect.orDie)
+        const message = yield* Effect.gen(function* () {
+          yield* revert.cleanup(session)
+          const message = yield* createUserMessage(promptInput)
+          yield* sessions.touch(input.sessionID)
+          yield* sessions.updatePart(receipt.part)
+          message.parts.push(receipt.part)
+          return message
+        }).pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+            return Effect.uninterruptible(
+              Effect.gen(function* () {
+                if (admission === undefined) {
+                  yield* core.finishWork(receipt.workID).pipe(Effect.orDie)
+                } else {
+                  yield* adapter
+                    .failInput(admission.generation, admission.workID, Cause.pretty(cause))
+                    .pipe(Effect.orDie)
+                  yield* wake(admission.generation.parentID).pipe(Effect.ignore)
+                }
+                return yield* Effect.failCause(cause)
+              }),
+            )
+          }),
+        )
 
-      const permissions: PermissionV1.Rule[] = []
-      for (const [t, enabled] of Object.entries(input.tools ?? {})) {
-        permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
-      }
-      if (permissions.length > 0) {
-        session.permission = permissions
-        yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
-      }
+        const permissions: PermissionV1.Rule[] = []
+        for (const [t, enabled] of Object.entries(input.tools ?? {})) {
+          permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
+        }
+        if (permissions.length > 0) {
+          session.permission = permissions
+          yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
+        }
 
-      if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID })
-    })
+        if (input.noReply === true) return message
+        return yield* loop({ sessionID: input.sessionID })
+      })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1092,10 +1144,23 @@ const layer = Layer.effect(
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
+          const assembled = yield* adapter.history(sessionID, msgs).pipe(Effect.orDie)
+          msgs = assembled.messages
 
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+          const latest = MessageV2.latest(msgs)
+          const latestUser = latest.user
+          const lastIncoming = assembled.incoming.at(-1)
+          const lastUser =
+            lastIncoming === undefined
+              ? latest.user
+              : msgs.findLast(
+                  (msg) => msg.info.role === "user" && msg.info.id === SessionV1.MessageID.make(lastIncoming.messageID),
+                )?.info
+          const { assistant: lastAssistant, finished: lastFinished, tasks } = latest
 
-          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+          if (!lastUser || lastUser.role !== "user") {
+            throw new Error("No user message found in stream. This should never happen.")
+          }
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1107,12 +1172,24 @@ const layer = Layer.effect(
             lastAssistantMsg?.parts.some(
               (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
             ) ?? false
+          const followsLatestUser =
+            latestUser !== undefined &&
+            (lastAssistant?.parentID === latestUser.id ||
+              (lastAssistant !== undefined &&
+                (yield* core.sources(sessionID).pipe(Effect.orDie)).some(
+                  (source) =>
+                    source.state === "finalized" &&
+                    source.source.kind === "assistant" &&
+                    source.source.id === lastAssistant.id &&
+                    historyCutoffIncludes(source, latestUser.id),
+                )))
 
           if (
+            assembled.incoming.length === 0 &&
             lastAssistant?.finish &&
             !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
             !hasToolCalls &&
-            lastAssistant.parentID === lastUser.id
+            followsLatestUser
           ) {
             const orphan = lastAssistantMsg?.parts.find(
               (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
@@ -1147,6 +1224,7 @@ const layer = Layer.effect(
           }
 
           if (task?.type === "compaction") {
+            const marker = yield* turn.remember(sessionID, PartID.ascending(), msgs).pipe(Effect.orDie)
             const result = yield* compaction.process({
               messages: msgs,
               parentID: lastUser.id,
@@ -1154,6 +1232,7 @@ const layer = Layer.effect(
               auto: task.auto,
               overflow: task.overflow,
             })
+            yield* turn.discard(marker).pipe(Effect.orDie)
             if (result === "stop") break
             continue
           }
@@ -1199,6 +1278,7 @@ const layer = Layer.effect(
             sessionID,
           }
           yield* sessions.updateMessage(msg)
+          let source: Delegation.SourceRecord | undefined
 
           const finalizeInterruptedAssistant = Effect.gen(function* () {
             if (msg.time.completed) return
@@ -1207,7 +1287,7 @@ const layer = Layer.effect(
               aborted: true,
             })
             msg.time.completed = Date.now()
-            yield* sessions.updateMessage(msg)
+            if (source === undefined) yield* sessions.updateMessage(msg)
           })
 
           const handle = yield* processor
@@ -1215,11 +1295,12 @@ const layer = Layer.effect(
               assistantMessage: msg,
               sessionID,
               model,
+              deferFinalization: true,
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
-            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+            const lastUserMsg = msgs.findLast((m) => m.info.id === lastUser.id)
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
 
@@ -1269,6 +1350,7 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            source = yield* turn.reserve(msg, msgs, assembled.incoming).pipe(Effect.orDie)
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1288,7 +1370,6 @@ const layer = Layer.effect(
             if (structured !== undefined) {
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
-              yield* sessions.updateMessage(handle.message)
               return "break" as const
             }
 
@@ -1302,7 +1383,6 @@ const layer = Layer.effect(
                 handle.message.error = new SessionV1.ContentFilterError({
                   message: "The response was blocked by the provider's content filter",
                 }).toObject()
-                yield* sessions.updateMessage(handle.message)
                 yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
                 return "break" as const
               }
@@ -1311,7 +1391,6 @@ const layer = Layer.effect(
                   message: "Model did not produce structured output",
                   retries: 0,
                 }).toObject()
-                yield* sessions.updateMessage(handle.message)
                 return "break" as const
               }
             }
@@ -1328,9 +1407,64 @@ const layer = Layer.effect(
             }
             return "continue" as const
           }).pipe(
+            Effect.catchCause((cause) => {
+              if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+              return Effect.uninterruptible(
+                Effect.gen(function* () {
+                  msg.error = MessageV2.fromError(Cause.squash(cause), { providerID: msg.providerID })
+                  msg.time.completed = Date.now()
+                  if (source === undefined) source = yield* turn.reserve(msg, msgs, []).pipe(Effect.orDie)
+                  const snapshot = {
+                    info: msg,
+                    parts: (yield* MessageV2.get({ sessionID, messageID: msg.id }).pipe(
+                      Effect.provideService(Database.Service, database),
+                      Effect.orDie,
+                    )).parts,
+                  }
+                  if (source === undefined) return yield* Effect.failCause(cause)
+                  yield* turn.complete(source, snapshot, "error").pipe(Effect.orDie)
+                  yield* delivery.announce(sessionID, msg.id).pipe(Effect.orDie)
+                  if (source.generationID !== undefined) {
+                    const generation = yield* core.get(source.generationID).pipe(Effect.orDie)
+                    if (generation !== undefined) yield* wake(generation.parentID).pipe(Effect.ignore)
+                  }
+                  return yield* Effect.failCause(cause)
+                }),
+              )
+            }),
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
+          if (source !== undefined) {
+            const snapshot = {
+              info: handle.message,
+              parts: (yield* MessageV2.get({ sessionID, messageID: msg.id }).pipe(
+                Effect.provideService(Database.Service, database),
+                Effect.orDie,
+              )).parts,
+            }
+            const outcome =
+              snapshot.info.role === "assistant" && snapshot.info.error !== undefined
+                ? ("error" as const)
+                : snapshot.info.role === "assistant" &&
+                    (structured !== undefined ||
+                      (snapshot.info.finish !== undefined &&
+                        !["tool-calls", "unknown"].includes(snapshot.info.finish) &&
+                        !snapshot.parts.some(isOrdinaryClientToolPart)))
+                  ? ("reply" as const)
+                  : ("discard" as const)
+            if (outcome === "discard") {
+              yield* turn.discard(source).pipe(Effect.orDie)
+              yield* sessions.updateMessage(handle.message)
+            } else {
+              yield* turn.complete(source, snapshot, outcome).pipe(Effect.orDie)
+              yield* delivery.announce(sessionID, msg.id).pipe(Effect.orDie)
+              if (source.generationID !== undefined) {
+                const generation = yield* core.get(source.generationID).pipe(Effect.orDie)
+                if (generation !== undefined) yield* wake(generation.parentID).pipe(Effect.ignore)
+              }
+            }
+          }
           if (outcome === "break") break
           continue
         }
@@ -1340,10 +1474,113 @@ const layer = Layer.effect(
       },
     )
 
+    const wake = Effect.fn("SessionPrompt.wake")(function* (sessionID: SessionID) {
+      const existing = yield* db
+        .select({ id: SessionTable.id })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+      if (existing === undefined) return
+
+      yield* turn.reconcile(sessionID).pipe(Effect.orDie)
+      yield* delivery.deliver(sessionID).pipe(Effect.orDie)
+      const incoming = (yield* core.incoming(sessionID).pipe(Effect.orDie)).filter(
+        (resolution) => resolution.status === "admitted" || resolution.status === "consumed",
+      )
+      if (incoming.length === 0) {
+        if (!(yield* state.busy(sessionID))) yield* adapter.close(sessionID, true).pipe(Effect.orDie)
+        return
+      }
+
+      const messages = yield* sessions.messages({ sessionID }).pipe(Effect.orDie)
+      if (messages.length === 0) return
+
+      const busy = yield* state.busy(sessionID)
+      if (!busy && (yield* adapter.blocked(sessionID).pipe(Effect.orDie))) {
+        yield* Effect.logWarning("wake blocked", { "session.id": sessionID })
+        return
+      }
+      yield* state.wake(sessionID, lastAssistant(sessionID), advisory(sessionID))
+    })
+
+    const recover = Effect.fn("SessionPrompt.recover")(function* () {
+      const ctx = yield* InstanceState.context
+      const generations = yield* db
+        .select({ parentID: DelegationGenerationTable.parent_id, childID: DelegationGenerationTable.child_id })
+        .from(DelegationGenerationTable)
+        .all()
+        .pipe(Effect.orDie)
+      const candidates = [...new Set(generations.flatMap((generation) => [generation.parentID, generation.childID]))]
+
+      yield* Effect.forEach(
+        candidates,
+        (sessionID) =>
+          Effect.gen(function* () {
+            const session = yield* db
+              .select({ id: SessionTable.id })
+              .from(SessionTable)
+              .where(
+                and(
+                  eq(SessionTable.id, sessionID),
+                  eq(SessionTable.directory, ctx.directory),
+                  eq(SessionTable.project_id, ctx.project.id),
+                ),
+              )
+              .get()
+              .pipe(Effect.orDie)
+            if (session === undefined) return
+            const revoked = yield* db
+              .select({ id: DelegationRevocationTable.session_id })
+              .from(DelegationRevocationTable)
+              .where(eq(DelegationRevocationTable.session_id, sessionID))
+              .get()
+              .pipe(Effect.orDie)
+            if (revoked !== undefined) {
+              yield* state.cancel(sessionID)
+              return
+            }
+            yield* turn.reconcile(sessionID).pipe(Effect.orDie)
+            yield* wake(sessionID)
+          }),
+        { concurrency: 1, discard: true },
+      )
+    })
+
+    const advisory = Effect.fnUntraced(function* (sessionID: SessionID) {
+      yield* turn.reconcile(sessionID).pipe(Effect.orDie)
+      const blocked = yield* adapter.blocked(sessionID).pipe(Effect.orDie)
+      const incoming = (yield* core.incoming(sessionID).pipe(Effect.orDie)).filter(
+        (resolution) => resolution.status === "admitted" || resolution.status === "consumed",
+      )
+      if (blocked || incoming.length === 0) {
+        if (!blocked) yield* adapter.close(sessionID, true).pipe(Effect.orDie)
+        return yield* lastAssistant(sessionID)
+      }
+
+      const result = yield* runLoop(sessionID)
+      yield* adapter.close(sessionID, true).pipe(Effect.orDie)
+      return result
+    })
+
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      const explicitWork = Effect.gen(function* () {
+        yield* core.allowSession(input.sessionID).pipe(Effect.orDie)
+        yield* turn.reconcile(input.sessionID).pipe(Effect.orDie)
+        const sources = yield* core.unfinishedSources(input.sessionID).pipe(Effect.orDie)
+        yield* Effect.forEach(sources, (source) => turn.discard(source).pipe(Effect.orDie), { discard: true })
+        const result = yield* runLoop(input.sessionID)
+        yield* adapter.close(input.sessionID, true).pipe(Effect.orDie)
+        return result
+      })
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        explicitWork,
+        advisory(input.sessionID),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
@@ -1482,6 +1719,8 @@ const layer = Layer.effect(
 
     return Service.of({
       cancel,
+      wake,
+      recover,
       prompt,
       loop,
       shell,
@@ -1589,6 +1828,17 @@ export function createStructuredOutputTool(input: {
     },
   })
 }
+
+function historyCutoffIncludes(source: Delegation.SourceRecord, messageID: SessionV1.MessageID) {
+  const json = Option.getOrUndefined(decodeHistoryCutoffJson(source.historyCutoff))
+  if (json === undefined) return false
+  return Option.getOrUndefined(decodeHistoryCutoff(json))?.messages.includes(messageID) ?? false
+}
+
+function isOrdinaryClientToolPart(part: SessionV1.Part) {
+  return part.type === "tool" && part.tool !== "StructuredOutput" && !part.metadata?.providerExecuted
+}
+
 const bashRegex = /!`([^`]+)`/g
 // Match [Image N] as single token, quoted strings, or non-space sequences
 const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi
@@ -1625,6 +1875,10 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    DelegationStore.node,
+    SessionDelegation.node,
+    SessionDelegationDelivery.node,
+    SessionDelegationTurn.node,
   ],
 })
 
