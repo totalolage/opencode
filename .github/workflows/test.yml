@@ -49,6 +49,12 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
 
+      # Avoid downloading ripgrep inside 5-second tests.
+      - name: Setup Ripgrep
+        if: github.repository != 'anomalyco/opencode'
+        timeout-minutes: 5
+        run: bun .github/scripts/setup-ripgrep.ts
+
       - name: Configure git identity
         run: |
           git config --global user.email "bot@opencode.ai"
@@ -65,7 +71,8 @@ jobs:
 
       - name: Run unit tests
         timeout-minutes: 20
-        run: GITHUB_ACTIONS=false bun turbo test
+        # Hosted runs serialize package tasks and cap concurrent tests to avoid contention between CLI subprocesses.
+        run: GITHUB_ACTIONS=false bun turbo test ${{ github.repository != 'anomalyco/opencode' && '--concurrency=1 -- --max-concurrency=2' || '' }}
         env:
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
 
