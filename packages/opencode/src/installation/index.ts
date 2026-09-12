@@ -1,7 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
-import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
-import { Effect, Layer, Schema, Context, Stream } from "effect"
+import { filesystem, httpClient } from "@opencode-ai/core/effect/app-node-platform"
+import { Effect, Layer, Schema, Context, Stream, FileSystem } from "effect"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { withTransientReadRetry } from "@/util/effect-http-client"
@@ -14,10 +14,27 @@ import semver from "semver"
 import { InstallationChannel, InstallationVersion } from "@opencode-ai/core/installation/version"
 import { NpmConfig } from "@opencode-ai/core/npm-config"
 import { InstallationEvent } from "@opencode-ai/schema/installation-event"
+import { Fork } from "./fork"
 
 export type Method = "curl" | "npm" | "yarn" | "pnpm" | "bun" | "brew" | "scoop" | "choco" | "unknown"
 
 export type ReleaseType = "patch" | "minor" | "major"
+
+export type UpdateDecision = "noop" | "notify" | "install"
+
+export type UpdatePolicyInput = {
+  current: string
+  latest: string
+  method: Method
+  autoupdate?: boolean | "notify"
+  alwaysNotify?: boolean
+}
+
+export type ManualUpgradeDecision =
+  | { type: "instructions" }
+  | { type: "lookup" }
+  | { type: "skip" }
+  | { type: "upgrade"; target: string }
 
 export const Event = InstallationEvent
 
@@ -30,6 +47,46 @@ export function getReleaseType(current: string, latest: string): ReleaseType {
   if (newMajor > currMajor) return "major"
   if (newMinor > currMinor) return "minor"
   return "patch"
+}
+
+export function decideUpdate(input: UpdatePolicyInput): UpdateDecision {
+  if (input.autoupdate === false) return "noop"
+
+  const current = Fork.stableVersion(input.current)
+  const latest = Fork.stableVersion(input.latest)
+  if (!current || !latest || !semver.gt(latest, current)) return "noop"
+
+  if (input.alwaysNotify || input.autoupdate === "notify") return "notify"
+
+  const kind = getReleaseType(current, latest)
+  if (kind !== "patch") return "notify"
+  if (input.method === "unknown") return "noop"
+  return "install"
+}
+
+export function decideManualUpgrade(input: {
+  current: string
+  requested?: string
+  latest?: string
+}): ManualUpgradeDecision {
+  if (input.requested !== undefined) {
+    const target = Fork.stableVersion(input.requested)
+    if (!target) return { type: "instructions" }
+    return { type: "upgrade", target }
+  }
+
+  const current = Fork.stableVersion(input.current)
+  if (!current) return { type: "instructions" }
+  if (input.latest === undefined) return { type: "lookup" }
+
+  const latest = Fork.stableVersion(input.latest)
+  if (!latest) return { type: "instructions" }
+  if (!semver.gt(latest, current)) return { type: "skip" }
+  return { type: "upgrade", target: latest }
+}
+
+export function canUseForkUpgrade(input: { actual: Method; requested?: string }) {
+  return input.actual === "curl" && (input.requested === undefined || input.requested === "curl")
 }
 
 export const Info = Schema.Struct({
@@ -60,6 +117,11 @@ export class UpgradeFailedError extends Schema.TaggedErrorClass<UpgradeFailedErr
   }
 }
 
+function toUpgradeFailedError(error: unknown) {
+  if (error instanceof UpgradeFailedError) return error
+  return new UpgradeFailedError({ stderr: errorMessage(error) })
+}
+
 // Response schemas for external version APIs
 const GitHubRelease = Schema.Struct({ tag_name: Schema.String })
 const NpmPackage = Schema.Struct({ version: Schema.String })
@@ -73,9 +135,9 @@ const ChocoPackage = Schema.Struct({
 const ScoopManifest = NpmPackage
 
 export interface Interface {
-  readonly info: () => Effect.Effect<Info>
+  readonly info: () => Effect.Effect<Info, UpgradeFailedError>
   readonly method: () => Effect.Effect<Method>
-  readonly latest: (method?: Method) => Effect.Effect<string>
+  readonly latest: (method?: Method) => Effect.Effect<string, UpgradeFailedError>
   readonly upgrade: (method: Method, target: string) => Effect.Effect<void, UpgradeFailedError>
 }
 
@@ -83,11 +145,14 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/In
 
 export const use = serviceUse(Service)
 
-const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Service> = Layer.effect(
+type LayerDependencies = HttpClient.HttpClient | FileSystem.FileSystem | AppProcess.Service
+
+const layer: Layer.Layer<Service, never, LayerDependencies> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const http = yield* HttpClient.HttpClient
     const httpOk = HttpClient.filterStatusOk(withTransientReadRetry(http))
+    const fileSystem = yield* FileSystem.FileSystem
     const appProcess = yield* AppProcess.Service
 
     const text = Effect.fnUntraced(
@@ -170,8 +235,10 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
           version: InstallationVersion,
           latest: yield* result.latest(),
         }
-      }),
+      }, Effect.mapError(toUpgradeFailedError)),
       method: Effect.fn("Installation.method")(function* () {
+        if (Fork.IS_FORK) return Fork.method(process.execPath)
+
         if (process.execPath.includes(path.join(".opencode", "bin"))) return "curl" as Method
         if (process.execPath.includes(path.join(".local", "bin"))) return "curl" as Method
         const exec = process.execPath.toLowerCase()
@@ -206,6 +273,10 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
         return "unknown" as Method
       }),
       latest: Effect.fn("Installation.latest")(function* (installMethod?: Method) {
+        if (Fork.IS_FORK) {
+          return yield* Fork.latest().pipe(Effect.provideService(HttpClient.HttpClient, http))
+        }
+
         const detectedMethod = installMethod || (yield* result.method())
 
         if (detectedMethod === "brew") {
@@ -261,8 +332,19 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
         )
         const data = yield* HttpClientResponse.schemaBodyJson(GitHubRelease)(response)
         return data.tag_name.replace(/^v/, "")
-      }, Effect.orDie),
+      }, Effect.mapError(toUpgradeFailedError)),
       upgrade: Effect.fn("Installation.upgrade")(function* (m: Method, target: string) {
+        if (Fork.IS_FORK) {
+          if (!canUseForkUpgrade({ actual: Fork.method(process.execPath), requested: m })) {
+            return yield* new UpgradeFailedError({ stderr: Fork.INSTRUCTIONS })
+          }
+          return yield* Fork.upgrade(target, process.execPath).pipe(
+            Effect.provideService(HttpClient.HttpClient, http),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(AppProcess.Service, appProcess),
+          )
+        }
+
         let upgradeResult: { code: number; stdout: string; stderr: string } | undefined
         switch (m) {
           case "curl":
@@ -318,14 +400,14 @@ const layer: Layer.Layer<Service, never, HttpClient.HttpClient | AppProcess.Serv
           stderr: upgradeResult.stderr,
         })
         yield* text([process.execPath, "--version"])
-      }),
+      }, Effect.mapError(toUpgradeFailedError)),
     }
 
     return Service.of(result)
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [httpClient, AppProcess.node] })
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [httpClient, filesystem, AppProcess.node] })
 
 const { runPromise } = makeRuntime(Service, AppNodeBuilder.build(node))
 

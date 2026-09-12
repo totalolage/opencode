@@ -1,0 +1,222 @@
+name: fork-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable release version (X.Y.Z)
+        required: true
+        type: string
+      ref:
+        description: Git ref to build
+        required: true
+        default: dev
+        type: string
+      publish:
+        description: Create a draft GitHub release
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: fork-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  resolve:
+    name: Resolve ref and validate version
+    if: github.repository == 'totalolage/opencode'
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Checkout requested ref
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Validate version
+        run: bun .github/scripts/fork-release.ts validate
+        env:
+          OPENCODE_VERSION: ${{ inputs.version }}
+
+      - name: Resolve commit
+        id: resolve
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse --verify HEAD^{commit})"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            printf 'resolved ref is not a commit SHA: %s\n' "$sha" >&2
+            exit 1
+          fi
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+          printf 'resolved %s\n' "$sha"
+
+  build:
+    name: Build (${{ matrix.name }})
+    needs: resolve
+    if: github.repository == 'totalolage/opencode' && needs.resolve.result == 'success'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: ubuntu-24.04
+            platform: linux
+            arch: x64
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            platform: linux
+            arch: arm64
+          - name: darwin-x64
+            runner: macos-15-intel
+            platform: darwin
+            arch: x64
+          - name: darwin-arm64
+            runner: macos-15
+            platform: darwin
+            arch: arm64
+    env:
+      OPENCODE_FORK_RELEASE: "1"
+      OPENCODE_VERSION: ${{ inputs.version }}
+      OPENCODE_CHANNEL: latest
+      FORK_RELEASE_PLATFORM: ${{ matrix.platform }}
+      FORK_RELEASE_ARCH: ${{ matrix.arch }}
+      FORK_RELEASE_OUTPUT_DIRECTORY: fork-release-artifacts
+    steps:
+      - name: Checkout resolved commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          unset OPENCODE_RELEASE
+          if [[ "$FORK_RELEASE_ARCH" == "x64" ]]; then
+            bun run --cwd packages/opencode build --single --skip-install --skip-embed-web-ui --baseline
+            exit 0
+          fi
+          bun run --cwd packages/opencode build --single --skip-install --skip-embed-web-ui
+
+      - name: Package and smoke test
+        run: |
+          set -euo pipefail
+          unset OPENCODE_RELEASE
+          bun .github/scripts/fork-release.ts package
+
+      - name: Verify fork upgrade
+        working-directory: packages/opencode
+        run: bun run script/verify-fork-upgrade.ts
+        timeout-minutes: 30
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fork-release-${{ matrix.name }}
+          path: fork-release-artifacts
+          if-no-files-found: error
+          retention-days: 7
+
+  aggregate:
+    name: Aggregate and verify archives
+    needs:
+      - resolve
+      - build
+    if: github.repository == 'totalolage/opencode' && needs.resolve.result == 'success' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout resolved commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Download platform artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: fork-release-*
+          path: release
+          merge-multiple: true
+
+      - name: Verify archives and generate checksums
+        run: bun .github/scripts/fork-release.ts verify
+        env:
+          FORK_RELEASE_ARTIFACT_DIRECTORY: release
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fork-release-assets
+          path: release
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish draft release
+    needs:
+      - resolve
+      - aggregate
+    if: github.repository == 'totalolage/opencode' && inputs.publish == true && needs.resolve.result == 'success' && needs.aggregate.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_SHA: ${{ needs.resolve.outputs.sha }}
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: fork-release-assets
+          path: release
+
+      - name: Create draft release and upload assets
+        run: |
+          set -euo pipefail
+          release_tag="v${RELEASE_VERSION}"
+          release_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            printf 'release already exists: %s\n' "$release_tag" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --refs "$release_url" "refs/tags/$release_tag" >/dev/null 2>&1; then
+            printf 'tag already exists: %s\n' "$release_tag" >&2
+            exit 1
+          else
+            tag_status=$?
+            if [[ "$tag_status" -ne 2 ]]; then
+              printf 'could not check tag: %s\n' "$release_tag" >&2
+              exit "$tag_status"
+            fi
+          fi
+
+          gh release create "$release_tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$RELEASE_SHA" \
+            --draft \
+            --title "$release_tag"
+          gh release upload "$release_tag" release/* --repo "$GITHUB_REPOSITORY"
