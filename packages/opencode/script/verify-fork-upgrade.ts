@@ -14,8 +14,17 @@ const COMMAND_TIMEOUT_MS = 60 * 1000
 const VERSION_TIMEOUT_MS = 20 * 1000
 const PROCESS_GROUP_GRACE_MS = 1000
 const PROCESS_GROUP_WATCHDOG_MS = PROCESS_GROUP_GRACE_MS * 3
+const ACTIONABLE_FORK_DIAGNOSTIC =
+  /Install the totalolage\/opencode fork from https:\/\/github\.com\/totalolage\/opencode\/releases and place the opencode binary at/i
+const CHECKSUM_MISMATCH_DIAGNOSTIC = /Checksum mismatch for .*expected [0-9a-f]{64}, received [0-9a-f]{64}/i
+const TRUNCATED_DOWNLOAD_DIAGNOSTIC =
+  /(Checksum mismatch for .*expected [0-9a-f]{64}, received [0-9a-f]{64}|content[- ]length|truncat|incomplete|premature|unexpected end|body.*(short|size))/i
+const MISSING_RELEASE_DIAGNOSTIC = /(HTTP 404|release.*not found|request failed with HTTP 404)/i
+const INVALID_RELEASE_DIAGNOSTIC = /Invalid release tag: not-a-version/i
+const PERMISSION_DIAGNOSTIC =
+  /(EACCES|EPERM|permission denied|permissiondenied|not writable|read-only|operation not permitted)/i
 
-type FixtureMode = "success" | "checksum-mismatch" | "truncated-download" | "missing-release"
+type FixtureMode = "success" | "checksum-mismatch" | "truncated-download" | "missing-release" | "malformed-metadata"
 
 type ReleasePaths = {
   latest: string
@@ -53,9 +62,11 @@ type Fixture = {
 type CommandResult = {
   command: string[]
   exitCode: number | null
+  signal: NodeJS.Signals | null
   stdout: string
   stderr: string
   timedOut: boolean
+  cleanupError?: string
 }
 
 type EvidenceError = {
@@ -63,6 +74,7 @@ type EvidenceError = {
   message: string
   command?: string[]
   exitCode?: number | null
+  signal?: NodeJS.Signals | null
   timedOut?: boolean
   stdout?: string
   stderr?: string
@@ -73,6 +85,7 @@ type BuildEvidence = {
   command: string[]
   binaryPath: string
   exitCode: number | null
+  signal?: NodeJS.Signals | null
   timedOut: boolean
   hash?: string
 }
@@ -85,13 +98,15 @@ type ScenarioDefinition = {
   expectSuccess: boolean
   expectedVersion: string
   requiredRoutes: Array<{ path: string; status: number }>
+  diagnostic?: RegExp
+  requiresNonzero?: boolean
   permission?: "parent-unwritable" | "binary-read-only"
 }
 
 type ScenarioEvidence = {
   name: string
   mode: FixtureMode
-  status: "passed" | "failed" | "skipped"
+  status: "passed" | "failed"
   executable: string
   command: string[]
   expected: "success" | "failure"
@@ -99,11 +114,14 @@ type ScenarioEvidence = {
   before?: { version: string; hash: string }
   after?: { version?: string; hash?: string }
   exitCode?: number | null
+  signal?: NodeJS.Signals | null
   timedOut?: boolean
+  stdout?: string
+  stderr?: string
   requests: FixtureRequest[]
   packageManagerCalls: string[]
   message?: string
-  skipReason?: string
+  cleanupError?: string
 }
 
 type Evidence = {
@@ -169,7 +187,11 @@ async function hashFile(filePath: string) {
 }
 
 function commandSucceeded(result: CommandResult) {
-  return result.exitCode === 0 && !result.timedOut
+  return result.exitCode === 0 && !result.timedOut && result.cleanupError === undefined
+}
+
+export function requireCommandCleanup(result: Pick<CommandResult, "cleanupError">) {
+  if (result.cleanupError) throw new Error(`command cleanup failed: ${result.cleanupError}`)
 }
 
 function runningOnGlibc() {
@@ -180,100 +202,260 @@ function runningOnGlibc() {
   return "glibcVersionRuntime" in report.header && typeof report.header.glibcVersionRuntime === "string"
 }
 
+const activeProcessGroups = new Set<number>()
+const processGroupTerminations = new Map<number, Promise<void>>()
+let interruptedBy: NodeJS.Signals | undefined
+let interruptionCleanup: Promise<void> | undefined
+let interruptionCleanupError: unknown
+
+function hasErrorCode(error: unknown, code: string) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code
+}
+
+function isProcessGroupId(pid: number | undefined): pid is number {
+  return pid !== undefined && Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals | 0) {
+  try {
+    process.kill(-pid, signal)
+    return true
+  } catch (error) {
+    if (hasErrorCode(error, "ESRCH")) return false
+    throw error
+  }
+}
+
+function processGroupExists(pid: number) {
+  try {
+    process.kill(-pid, 0)
+    return true
+  } catch (error) {
+    if (hasErrorCode(error, "ESRCH")) return false
+    if (hasErrorCode(error, "EPERM")) return true
+    throw error
+  }
+}
+
+function delay(milliseconds: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
+}
+
+async function waitForProcessGroupExit(pid: number, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs
+  while (processGroupExists(pid)) {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return false
+    await delay(Math.min(25, remaining))
+  }
+  return true
+}
+
+async function terminateProcessGroup(pid: number) {
+  if (!signalProcessGroup(pid, "SIGTERM")) return
+  if (await waitForProcessGroupExit(pid, PROCESS_GROUP_GRACE_MS)) return
+  signalProcessGroup(pid, "SIGKILL")
+  if (!(await waitForProcessGroupExit(pid, PROCESS_GROUP_WATCHDOG_MS))) {
+    throw new Error(`process group ${pid} survived SIGKILL`)
+  }
+}
+
+function ensureProcessGroupTerminated(pid: number) {
+  const existing = processGroupTerminations.get(pid)
+  if (existing) return existing
+  const termination = terminateProcessGroup(pid).finally(() => processGroupTerminations.delete(pid))
+  processGroupTerminations.set(pid, termination)
+  return termination
+}
+
+async function terminateActiveProcessGroups() {
+  const groups = [...activeProcessGroups]
+  const results = await Promise.allSettled(groups.map((pid) => ensureProcessGroupTerminated(pid)))
+  const errors = results.filter((result): result is PromiseRejectedResult => result.status === "rejected")
+  if (errors.length > 0) throw new Error(errors.map((result) => messageOf(result.reason)).join("; "))
+  groups.forEach((pid) => activeProcessGroups.delete(pid))
+}
+
+function requestInterruption(signal: NodeJS.Signals) {
+  interruptedBy ??= signal
+  interruptionCleanup ??= terminateActiveProcessGroups().catch((error) => {
+    interruptionCleanupError = error
+  })
+}
+
+export function installSignalHandlers() {
+  const onInterrupt = () => requestInterruption("SIGINT")
+  const onTerminate = () => requestInterruption("SIGTERM")
+  process.on("SIGINT", onInterrupt)
+  process.on("SIGTERM", onTerminate)
+  return () => {
+    process.off("SIGINT", onInterrupt)
+    process.off("SIGTERM", onTerminate)
+  }
+}
+
+function throwIfInterrupted() {
+  if (interruptedBy) throw new Error(`process interrupted by ${interruptedBy}`)
+}
+
+function captureOutput(stream: Readable | null) {
+  if (!stream) return Promise.resolve("")
+  stream.setEncoding("utf8")
+  return new Promise<string>((resolve) => {
+    let output = ""
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      resolve(output)
+    }
+    stream.on("data", (chunk: string) => {
+      output += chunk
+    })
+    stream.once("end", finish)
+    stream.once("close", finish)
+    stream.once("error", (error) => {
+      output += `${output.length > 0 ? "\n" : ""}${messageOf(error)}`
+      finish()
+    })
+  })
+}
+
+function waitForChild(child: ReturnType<typeof spawn>) {
+  return new Promise<{ exitCode: number | null; signal: NodeJS.Signals | null; error?: unknown }>((resolve) => {
+    let settled = false
+    const finish = (result: { exitCode: number | null; signal: NodeJS.Signals | null; error?: unknown }) => {
+      if (settled) return
+      settled = true
+      resolve(result)
+    }
+    child.once("error", (error) => finish({ exitCode: null, signal: null, error }))
+    child.once("exit", (exitCode, signal) => finish({ exitCode, signal }))
+  })
+}
+
 function commandFailure(stage: string, result: CommandResult, message: string): EvidenceError {
   return {
     stage,
     message,
     command: result.command,
     exitCode: result.exitCode,
+    signal: result.signal,
     timedOut: result.timedOut,
     stdout: result.stdout,
     stderr: result.stderr,
   }
 }
 
-async function runCommand(
+export async function runCommand(
   command: string[],
   options: { cwd: string; env: Record<string, string>; timeoutMs: number },
 ): Promise<CommandResult> {
-  const controller = new AbortController()
-  const signal = controller.signal
-  let timeoutTimer: ReturnType<typeof setTimeout> | number | undefined
-  const timeout = new Promise<{ kind: "timeout" }>((resolve) => {
-    timeoutTimer = setTimeout(() => {
-      controller.abort()
-      resolve({ kind: "timeout" })
-    }, options.timeoutMs)
-  })
-  let child: ReturnType<typeof Bun.spawn>
-
+  throwIfInterrupted()
+  let child: ReturnType<typeof spawn>
   try {
-    child = Bun.spawn(command, {
+    child = spawn(command[0], command.slice(1), {
       cwd: options.cwd,
       env: options.env,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
-      signal,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
     })
   } catch (error) {
-    if (timeoutTimer) clearTimeout(timeoutTimer)
     return {
       command,
       exitCode: null,
+      signal: null,
       stdout: "",
       stderr: messageOf(error),
       timedOut: false,
     }
   }
 
-  const capture = Promise.allSettled([
-    typeof child.stdout === "number" ? Promise.resolve("") : new Response(child.stdout).text(),
-    typeof child.stderr === "number" ? Promise.resolve("") : new Response(child.stderr).text(),
-    child.exited,
-  ]).then(([stdout, stderr, exitCode]) => ({
-    stdout: stdout.status === "fulfilled" ? stdout.value : messageOf(stdout.reason),
-    stderr: stderr.status === "fulfilled" ? stderr.value : messageOf(stderr.reason),
-    exitCode: exitCode.status === "fulfilled" ? exitCode.value : null,
-  }))
-
-  try {
-    const first = await Promise.race([capture.then((value) => ({ kind: "done" as const, value })), timeout])
-
-    if (first.kind === "done") {
-      return {
-        command,
-        exitCode: first.value.exitCode,
-        stdout: first.value.stdout,
-        stderr: first.value.stderr,
-        timedOut: signal.aborted,
-      }
-    }
-
-    child.kill()
-    let graceTimer: ReturnType<typeof setTimeout> | number | undefined
-    const afterKill = await Promise.race([
-      capture,
-      new Promise<undefined>((resolve) => {
-        graceTimer = setTimeout(resolve, 1000)
-      }),
-    ])
-    if (graceTimer) clearTimeout(graceTimer)
+  const childExit = waitForChild(child)
+  const stdout = captureOutput(child.stdout)
+  const stderr = captureOutput(child.stderr)
+  if (!isProcessGroupId(child.pid)) {
+    child.kill("SIGKILL")
+    child.stdout?.destroy()
+    child.stderr?.destroy()
+    const result = await childExit
     return {
       command,
-      exitCode: afterKill?.exitCode ?? null,
-      stdout: afterKill?.stdout ?? "",
-      stderr: [afterKill?.stderr, `process timed out after ${options.timeoutMs}ms`].filter(Boolean).join("\n"),
-      timedOut: true,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      stdout: await stdout,
+      stderr: [await stderr, result.error ? messageOf(result.error) : "", "child did not provide a safe process group"]
+        .filter(Boolean)
+        .join("\n"),
+      timedOut: false,
+      cleanupError: "child did not provide a safe process group",
+    }
+  }
+
+  const pid = child.pid
+  activeProcessGroups.add(pid)
+  let timedOut = false
+  let cleanupError: string | undefined
+  let termination: Promise<void> | undefined
+  let outputWatchdogTimer: ReturnType<typeof setTimeout> | undefined
+  const terminate = () => {
+    termination ??= ensureProcessGroupTerminated(pid)
+    return termination
+  }
+  const timeoutTimer = setTimeout(() => {
+    timedOut = true
+    void terminate().catch((error) => {
+      cleanupError = messageOf(error)
+    })
+  }, options.timeoutMs)
+  const watchdogTimer = setTimeout(() => {
+    if (!timedOut) return
+    child.kill("SIGKILL")
+    child.stdout?.destroy()
+    child.stderr?.destroy()
+  }, options.timeoutMs + PROCESS_GROUP_WATCHDOG_MS)
+
+  try {
+    const result = await childExit
+    if (!timedOut) clearTimeout(timeoutTimer)
+    outputWatchdogTimer = setTimeout(() => {
+      child.stdout?.destroy()
+      child.stderr?.destroy()
+    }, PROCESS_GROUP_WATCHDOG_MS)
+    try {
+      await terminate()
+    } catch (error) {
+      cleanupError = messageOf(error)
+    }
+    return {
+      command,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      stdout: await stdout,
+      stderr: [
+        await stderr,
+        result.error ? messageOf(result.error) : "",
+        timedOut ? `process timed out after ${options.timeoutMs}ms` : "",
+        cleanupError ? `process group cleanup failed: ${cleanupError}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      timedOut,
+      cleanupError,
     }
   } finally {
-    if (timeoutTimer) clearTimeout(timeoutTimer)
+    clearTimeout(timeoutTimer)
+    clearTimeout(watchdogTimer)
+    if (outputWatchdogTimer) clearTimeout(outputWatchdogTimer)
+    if (cleanupError === undefined) activeProcessGroups.delete(pid)
   }
 }
 
 function inheritedEnvironment(overrides: Record<string, string> = {}) {
   const env = { ...Bun.env, ...overrides }
   delete env.OPENCODE_RELEASE
+  delete env.NODE_OPTIONS
+  delete env.BUN_OPTIONS
   return env
 }
 
@@ -283,6 +465,7 @@ function buildEnvironment(origin: string, version: string, modelsSnapshot: strin
   delete env.OPENCODE_CONFIG
   delete env.OPENCODE_CONFIG_DIR
   delete env.OPENCODE_CONFIG_CONTENT
+  delete env.OPENCODE_TEST_HOME
   delete env.OPENCODE_FORK_TEST_ORIGIN
   delete env.OPENCODE_FORK_RELEASE
   delete env.OPENCODE_UPSTREAM_BUILD
@@ -325,6 +508,7 @@ async function runtimeEnvironment(root: string, shims: { directory: string; log:
   delete env.OPENCODE_CONFIG
   delete env.OPENCODE_CONFIG_DIR
   delete env.OPENCODE_CONFIG_CONTENT
+  delete env.OPENCODE_TEST_HOME
   delete env.OPENCODE_DISABLE_AUTOUPDATE
   delete env.OPENCODE_ALWAYS_NOTIFY_UPDATE
   const home = path.join(root, "home")
@@ -337,6 +521,7 @@ async function runtimeEnvironment(root: string, shims: { directory: string; log:
   return {
     ...env,
     HOME: home,
+    OPENCODE_TEST_HOME: home,
     XDG_CONFIG_HOME: config,
     XDG_DATA_HOME: data,
     XDG_CACHE_HOME: cache,
@@ -416,7 +601,7 @@ function releaseMetadata(fixture: Fixture) {
     id: 123456,
     author: fixtureUser(fixture.origin, "fixture-author"),
     node_id: "fixture-release",
-    tag_name: `v${NEW_VERSION}`,
+    tag_name: fixture.mode === "malformed-metadata" ? "not-a-version" : `v${NEW_VERSION}`,
     target_commitish: "dev",
     name: `v${NEW_VERSION}`,
     draft: false,
@@ -433,7 +618,7 @@ function releaseMetadata(fixture: Fixture) {
         release.archiveBytes.byteLength,
         release.archiveName.endsWith(".zip") ? "application/zip" : "application/gzip",
         1,
-        fixture.mode === "checksum-mismatch" ? "0".repeat(64) : release.archiveHash,
+        release.archiveHash,
       ),
       asset(
         release.checksumName,
@@ -577,11 +762,13 @@ async function buildVersion(
     env: buildEnvironment(origin, version, modelsSnapshot),
     timeoutMs: BUILD_TIMEOUT_MS,
   })
+  throwIfInterrupted()
   const build: BuildEvidence = {
     version,
     command,
     binaryPath,
     exitCode: result.exitCode,
+    signal: result.signal,
     timedOut: result.timedOut,
   }
   evidence.builds.push(build)
@@ -645,6 +832,7 @@ async function packageRelease(
     env: runtimeEnv,
     timeoutMs: COMMAND_TIMEOUT_MS,
   })
+  throwIfInterrupted()
   if (!commandSucceeded(packageResult)) {
     evidence.errors.push(commandFailure("package", packageResult, "release archive packaging failed"))
     throw new Error("release archive packaging failed")
@@ -667,6 +855,7 @@ async function packageRelease(
     env: runtimeEnv,
     timeoutMs: COMMAND_TIMEOUT_MS,
   })
+  throwIfInterrupted()
   if (!commandSucceeded(verifyResult)) {
     evidence.errors.push(commandFailure("package-verify", verifyResult, "release archive could not be extracted"))
     throw new Error("release archive could not be extracted")
@@ -716,7 +905,7 @@ function assertRoutes(scenario: ScenarioDefinition, requests: FixtureRequest[]) 
   }
 }
 
-async function runScenario(ctx: RuntimeContext, scenario: ScenarioDefinition, permissionsEnabled: boolean) {
+async function runScenario(ctx: RuntimeContext, scenario: ScenarioDefinition) {
   const executable = scenario.executable === "installed" ? ctx.installedPath : ctx.unknownPath
   const command = [executable, ...scenario.args]
   const record: ScenarioEvidence = {
@@ -731,12 +920,6 @@ async function runScenario(ctx: RuntimeContext, scenario: ScenarioDefinition, pe
     packageManagerCalls: [],
   }
   const start = ctx.fixture.requests.length
-
-  if (scenario.permission && !permissionsEnabled) {
-    record.status = "skipped"
-    record.skipReason = "permission checks require a non-root process"
-    return record
-  }
 
   ctx.fixture.mode = scenario.mode
   ctx.fixture.scenario = scenario.name
@@ -779,36 +962,37 @@ async function runScenario(ctx: RuntimeContext, scenario: ScenarioDefinition, pe
       env: ctx.runtimeEnv,
       timeoutMs: COMMAND_TIMEOUT_MS,
     })
+    record.cleanupError = result.cleanupError
+    requireCommandCleanup(result)
+    throwIfInterrupted()
     record.exitCode = result.exitCode
+    record.signal = result.signal
     record.timedOut = result.timedOut
+    record.stdout = result.stdout
+    record.stderr = result.stderr
     const succeeded = commandSucceeded(result)
-    const instruction =
-      /installed to|package manager|managed by|manual|unsupported|unknown|unmanaged|skipped|cancel/i.test(
-        `${result.stdout}\n${result.stderr}`,
-      )
+    const output = `${result.stdout}\n${result.stderr}`
+    const diagnosticMatched = scenario.diagnostic?.test(output) ?? true
     const nonzeroFailure = result.exitCode !== null && result.exitCode !== 0
-    const acceptedUnknownInstruction = scenario.name === "unknown-install-location" && succeeded && instruction
+    const requiresNonzero = scenario.requiresNonzero ?? !scenario.expectSuccess
     const statusError = result.timedOut
       ? "scenario command timed out"
       : scenario.expectSuccess && !succeeded
         ? "successful upgrade exited unsuccessfully"
-        : !scenario.expectSuccess && !nonzeroFailure && !acceptedUnknownInstruction
+        : requiresNonzero && !nonzeroFailure
           ? "negative upgrade scenario did not fail with a nonzero exit code"
-          : !scenario.expectSuccess && succeeded && !acceptedUnknownInstruction
-            ? "negative upgrade scenario unexpectedly succeeded"
+          : scenario.diagnostic && !diagnosticMatched
+            ? "scenario output did not contain the expected diagnostic"
             : undefined
     if (statusError) ctx.evidence.errors.push(commandFailure(`scenario:${scenario.name}`, result, statusError))
-    if (!scenario.expectSuccess && nonzeroFailure) {
-      ctx.evidence.errors.push(commandFailure(`scenario:${scenario.name}`, result, "expected upgrade failure"))
-    }
     const calls = await packageManagerCalls(ctx.shimLog)
-    if (scenario.name === "unsupported-method-npm") {
-      if (calls.length > 0) {
-        ctx.evidence.errors.push({
-          stage: `scenario:${scenario.name}:package-manager`,
-          message: `unsupported npm method invoked a package manager: ${calls.join(", ")}`,
-        })
-      }
+    if (calls.length > 0) {
+      const message = `fork upgrade invoked a package manager: ${calls.join(", ")}`
+      ctx.evidence.errors.push({
+        stage: `scenario:${scenario.name}:package-manager`,
+        message,
+      })
+      throw new Error(message)
     }
 
     const afterHash = await hashFile(executable)
@@ -845,10 +1029,6 @@ async function runScenario(ctx: RuntimeContext, scenario: ScenarioDefinition, pe
     }
 
     if (statusError) throw new Error(statusError)
-    if (scenario.name === "unsupported-method-npm" && calls.length > 0) {
-      throw new Error(`unsupported npm method invoked a package manager: ${calls.join(", ")}`)
-    }
-
     record.packageManagerCalls = await packageManagerCalls(ctx.shimLog)
     record.status = "passed"
   } catch (error) {
@@ -891,10 +1071,6 @@ function scenarioDefinitions(paths: ReleasePaths): ScenarioDefinition[] {
     { path: paths.archive, status: 200 },
     { path: paths.checksums, status: 200 },
   ]
-  const truncatedRoutes = [
-    { path: paths.latest, status: 200 },
-    { path: paths.archive, status: 200 },
-  ]
   return [
     {
       name: "latest-success",
@@ -925,7 +1101,8 @@ function scenarioDefinitions(paths: ReleasePaths): ScenarioDefinition[] {
       executable: "installed",
       expectSuccess: false,
       expectedVersion: OLD_VERSION,
-      requiredRoutes: truncatedRoutes,
+      requiredRoutes: successfulRoutes,
+      diagnostic: CHECKSUM_MISMATCH_DIAGNOSTIC,
     },
     {
       name: "truncated-download",
@@ -935,6 +1112,7 @@ function scenarioDefinitions(paths: ReleasePaths): ScenarioDefinition[] {
       expectSuccess: false,
       expectedVersion: OLD_VERSION,
       requiredRoutes: successfulRoutes,
+      diagnostic: TRUNCATED_DOWNLOAD_DIAGNOSTIC,
     },
     {
       name: "missing-release-404",
@@ -944,6 +1122,17 @@ function scenarioDefinitions(paths: ReleasePaths): ScenarioDefinition[] {
       expectSuccess: false,
       expectedVersion: OLD_VERSION,
       requiredRoutes: [{ path: paths.latest, status: 404 }],
+      diagnostic: MISSING_RELEASE_DIAGNOSTIC,
+    },
+    {
+      name: "malformed-metadata",
+      mode: "malformed-metadata",
+      args: ["upgrade"],
+      executable: "installed",
+      expectSuccess: false,
+      expectedVersion: OLD_VERSION,
+      requiredRoutes: [{ path: paths.latest, status: 200 }],
+      diagnostic: INVALID_RELEASE_DIAGNOSTIC,
     },
     {
       name: "unsupported-method-npm",
@@ -953,6 +1142,7 @@ function scenarioDefinitions(paths: ReleasePaths): ScenarioDefinition[] {
       expectSuccess: false,
       expectedVersion: OLD_VERSION,
       requiredRoutes: [],
+      diagnostic: ACTIONABLE_FORK_DIAGNOSTIC,
     },
     {
       name: "unknown-install-location",
@@ -962,6 +1152,7 @@ function scenarioDefinitions(paths: ReleasePaths): ScenarioDefinition[] {
       expectSuccess: false,
       expectedVersion: OLD_VERSION,
       requiredRoutes: [],
+      diagnostic: ACTIONABLE_FORK_DIAGNOSTIC,
     },
     {
       name: "permission-parent-unwritable",
@@ -971,6 +1162,7 @@ function scenarioDefinitions(paths: ReleasePaths): ScenarioDefinition[] {
       expectSuccess: false,
       expectedVersion: OLD_VERSION,
       requiredRoutes: [],
+      diagnostic: PERMISSION_DIAGNOSTIC,
       permission: "parent-unwritable",
     },
     {
@@ -981,6 +1173,7 @@ function scenarioDefinitions(paths: ReleasePaths): ScenarioDefinition[] {
       expectSuccess: false,
       expectedVersion: OLD_VERSION,
       requiredRoutes: [],
+      diagnostic: PERMISSION_DIAGNOSTIC,
       permission: "binary-read-only",
     },
   ]
@@ -1006,6 +1199,7 @@ async function main() {
   }
   let root: string | undefined
   let stopServer: (() => Promise<void>) | undefined
+  let removeSignalHandlers: (() => void) | undefined
   let fixture: Fixture | undefined
   let failed = false
 
@@ -1017,10 +1211,14 @@ async function main() {
     if (process.arch !== "x64" && process.arch !== "arm64") {
       throw new Error(`unsupported architecture ${process.arch}; only x64 and arm64 are supported`)
     }
+    if (typeof process.getuid === "function" && process.getuid() === 0) {
+      throw new Error("fork upgrade verification must run as a non-root user so permission scenarios are meaningful")
+    }
     if (!/^\d+\.\d+\.\d+$/.test(OLD_VERSION) || !/^\d+\.\d+\.\d+$/.test(NEW_VERSION)) {
       throw new Error("verification versions must be strict stable versions")
     }
 
+    removeSignalHandlers = installSignalHandlers()
     root = await mkdtemp(path.join(os.tmpdir(), "opencode-fork-upgrade-"))
     const packageDir = path.resolve(import.meta.dir, "..")
     const archiveName =
@@ -1094,6 +1292,7 @@ async function main() {
     }
 
     if (fixture.requests.length > 0) throw new Error("fixture received a release request during build or packaging")
+    throwIfInterrupted()
 
     const context: RuntimeContext = {
       root,
@@ -1107,16 +1306,18 @@ async function main() {
       fixture,
       evidence,
     }
-    const permissionsEnabled = !(typeof process.getuid === "function" && process.getuid() === 0)
     for (const scenario of scenarioDefinitions(fixture.paths)) {
+      throwIfInterrupted()
       await writeFile(shims.log, "")
-      const result = await runScenario(context, scenario, permissionsEnabled)
+      const result = await runScenario(context, scenario)
       evidence.scenarios.push(result)
+      if (result.cleanupError) throw new Error(`scenario process cleanup failed: ${result.cleanupError}`)
     }
 
     if (evidence.scenarios.some((scenario) => scenario.status === "failed")) {
       throw new Error("one or more fork upgrade scenarios failed")
     }
+    throwIfInterrupted()
     if (fixture.requests.some((request) => !request.known)) {
       throw new Error("fixture received an unknown route")
     }
@@ -1125,6 +1326,23 @@ async function main() {
     evidence.errors.push({ stage: "fatal", message: messageOf(error) })
   } finally {
     if (fixture) evidence.requestRoutes = fixture.requests
+    let processGroupCleanupError: unknown
+    if (interruptionCleanup) await interruptionCleanup
+    try {
+      await terminateActiveProcessGroups()
+    } catch (error) {
+      processGroupCleanupError = error
+    }
+    if (interruptionCleanupError) {
+      processGroupCleanupError = processGroupCleanupError
+        ? `${messageOf(processGroupCleanupError)}; ${messageOf(interruptionCleanupError)}`
+        : interruptionCleanupError
+    }
+    if (processGroupCleanupError) {
+      failed = true
+      evidence.errors.push({ stage: "cleanup:process-groups", message: messageOf(processGroupCleanupError) })
+    }
+    if (removeSignalHandlers) removeSignalHandlers()
     if (stopServer) {
       try {
         await stopServer()
@@ -1144,9 +1362,10 @@ async function main() {
     }
   }
 
-  evidence.ok = !failed && evidence.scenarios.every((scenario) => scenario.status !== "failed")
+  evidence.ok =
+    !failed && interruptedBy === undefined && evidence.scenarios.every((scenario) => scenario.status === "passed")
   process.stdout.write(`${JSON.stringify(evidence, null, 2)}\n`)
   if (!evidence.ok) process.exitCode = 1
 }
 
-await main()
+if (import.meta.main) await main()
