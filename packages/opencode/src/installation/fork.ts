@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto"
 import { lstat } from "node:fs/promises"
+import type { BigIntStats } from "node:fs"
 import { basename, dirname, join } from "node:path"
 import { gunzipSync } from "node:zlib"
 import type { Entry } from "@zip.js/zip.js"
@@ -51,7 +52,7 @@ type Asset = {
 export function stableVersion(input: string): string | undefined {
   if (typeof input !== "string") return undefined
   const match = /^(?:v)?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(input)
-  if (!match) return undefined
+  if (!match || match[0] !== input) return undefined
 
   const version = `${match[1]}.${match[2]}.${match[3]}`
   return semver.valid(version) === version ? version : undefined
@@ -95,13 +96,19 @@ export function upgrade(
       const asset = currentAsset()
       if (asset instanceof ForkUpdateError) return yield* asset
 
+      const fs = yield* FileSystem.FileSystem
+      const initialParents = yield* inspectParents(execPath)
       const initialTarget = yield* inspectTarget(execPath)
       const initialTargetError = validateTarget(initialTarget, execPath)
       if (initialTargetError) return yield* initialTargetError
+      yield* fs.access(execPath, { writable: true })
+      yield* fs.access(dirname(execPath), { writable: true })
 
       const http = yield* HttpClient.HttpClient
-      const fs = yield* FileSystem.FileSystem
-      const stage = yield* fs.makeTempDirectoryScoped({ directory: dirname(execPath), prefix: ".opencode-update-" })
+      const stage = yield* Effect.acquireRelease(
+        fs.makeTempDirectory({ directory: dirname(execPath), prefix: ".opencode-update-" }),
+        (stage) => cleanupStage(fs, execPath, initialParents, stage),
+      )
       const stagedPath = join(stage, "opencode")
       yield* fetchRelease(http, version)
       const archiveUrl = `${assetOrigin()}/${repository}/releases/download/v${version}/${asset.filename}`
@@ -118,14 +125,36 @@ export function upgrade(
       }
 
       const binary = yield* extract(archive, asset.format)
-      yield* fs.writeFile(stagedPath, binary, { mode: 0o755 })
+      const beforeWriteParents = yield* inspectParents(execPath)
+      if (!sameParentIdentity(initialParents, beforeWriteParents)) {
+        return yield* new ForkUpdateError({ message: `Fork installation directory changed during update: ${execPath}` })
+      }
+      const beforeWriteTarget = yield* inspectTarget(execPath)
+      const beforeWriteTargetError = validateTarget(beforeWriteTarget, execPath)
+      if (beforeWriteTargetError) return yield* beforeWriteTargetError
+      if (!sameTargetIdentity(initialTarget, beforeWriteTarget)) {
+        return yield* new ForkUpdateError({ message: `Fork target changed during update: ${execPath}` })
+      }
+
+      yield* fs.writeFile(stagedPath, binary, { flag: "wx", mode: 0o755 })
       yield* fs.chmod(stagedPath, 0o755)
 
       yield* Effect.uninterruptible(
         Effect.gen(function* () {
+          const finalParents = yield* inspectParents(execPath)
+          if (!sameParentIdentity(initialParents, finalParents)) {
+            return yield* new ForkUpdateError({
+              message: `Fork installation directory changed during update: ${execPath}`,
+            })
+          }
           const finalTarget = yield* inspectTarget(execPath)
           const finalTargetError = validateTarget(finalTarget, execPath)
           if (finalTargetError) return yield* finalTargetError
+          if (!sameTargetIdentity(initialTarget, finalTarget)) {
+            return yield* new ForkUpdateError({ message: `Fork target changed during update: ${execPath}` })
+          }
+          yield* fs.access(execPath, { writable: true })
+          yield* fs.access(dirname(execPath), { writable: true })
           yield* fs.rename(stagedPath, execPath)
         }),
       )
@@ -143,7 +172,7 @@ function assetOrigin() {
 
 function isStrictTestOrigin(origin: string) {
   const match = /^http:\/\/127\.0\.0\.1:([0-9]+)$/.exec(origin)
-  if (!match) return false
+  if (!match || match[0] !== origin) return false
   const port = Number(match[1])
   return Number.isSafeInteger(port) && port > 0 && port <= 65535 && String(port) === match[1]
 }
@@ -319,13 +348,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
 
-type TargetStats = Awaited<ReturnType<typeof lstat>>
+type TargetStats = BigIntStats
+type ParentSnapshots = {
+  readonly destination: BigIntStats
+  readonly install: BigIntStats
+}
 
 function inspectTarget(execPath: string): Effect.Effect<TargetStats | undefined, unknown> {
   return Effect.tryPromise({
-    try: () => lstat(execPath),
+    try: () => lstat(execPath, { bigint: true }),
     catch: (cause) => cause,
   }).pipe(Effect.catchIf(isNotFound, () => Effect.succeed(undefined)))
+}
+
+function inspectParents(execPath: string): Effect.Effect<ParentSnapshots, unknown> {
+  return Effect.gen(function* () {
+    const destinationPath = dirname(execPath)
+    const destination = yield* inspectDirectory(destinationPath)
+    const installPath = dirname(destinationPath)
+    const install = yield* inspectDirectory(installPath)
+    return { destination, install }
+  })
+}
+
+function inspectDirectory(path: string): Effect.Effect<BigIntStats, unknown> {
+  return Effect.gen(function* () {
+    const stats = yield* inspectTarget(path)
+    if (stats === undefined) {
+      return yield* new ForkUpdateError({ message: `Fork installation directory does not exist: ${path}` })
+    }
+    if (stats.isSymbolicLink()) {
+      return yield* new ForkUpdateError({ message: `Refusing to use symlink installation directory: ${path}` })
+    }
+    if (!stats.isDirectory()) {
+      return yield* new ForkUpdateError({ message: `Fork installation path is not a directory: ${path}` })
+    }
+    return stats
+  })
 }
 
 function isNotFound(cause: unknown) {
@@ -333,11 +392,52 @@ function isNotFound(cause: unknown) {
 }
 
 function validateTarget(target: TargetStats | undefined, execPath: string): ForkUpdateError | undefined {
-  if (target === undefined) return undefined
+  if (target === undefined) return new ForkUpdateError({ message: `Fork target does not exist: ${execPath}` })
   if (target.isSymbolicLink())
     return new ForkUpdateError({ message: `Refusing to replace symlink target: ${execPath}` })
   if (!target.isFile()) return new ForkUpdateError({ message: `Fork target is not a regular file: ${execPath}` })
+  if ((target.mode & 0o222n) === 0n) return new ForkUpdateError({ message: `Fork target is not writable: ${execPath}` })
   return undefined
+}
+
+function sameTargetIdentity(expected: TargetStats | undefined, actual: TargetStats | undefined) {
+  return (
+    expected !== undefined &&
+    actual !== undefined &&
+    expected.dev === actual.dev &&
+    expected.ino === actual.ino &&
+    expected.size === actual.size &&
+    expected.mtimeNs === actual.mtimeNs
+  )
+}
+
+function sameParentIdentity(expected: ParentSnapshots, actual: ParentSnapshots) {
+  return (
+    expected.destination.dev === actual.destination.dev &&
+    expected.destination.ino === actual.destination.ino &&
+    expected.install.dev === actual.install.dev &&
+    expected.install.ino === actual.install.ino
+  )
+}
+
+function cleanupStage(fs: FileSystem.FileSystem, execPath: string, parents: ParentSnapshots, stage: string) {
+  return Effect.gen(function* () {
+    const destination = yield* inspectTarget(dirname(execPath))
+    if (!sameDirectoryIdentity(destination, parents.destination)) return
+    const install = yield* inspectTarget(dirname(dirname(execPath)))
+    if (!sameDirectoryIdentity(install, parents.install)) return
+    yield* fs.remove(stage, { force: true, recursive: true })
+  }).pipe(Effect.catch(() => Effect.void))
+}
+
+function sameDirectoryIdentity(actual: BigIntStats | undefined, expected: BigIntStats) {
+  return (
+    actual !== undefined &&
+    actual.isDirectory() &&
+    !actual.isSymbolicLink() &&
+    actual.dev === expected.dev &&
+    actual.ino === expected.ino
+  )
 }
 
 function expectedChecksum(text: string, filename: string): string | ForkUpdateError {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
+import { createHash } from "node:crypto"
 import os from "os"
 import path from "path"
 
@@ -27,9 +28,8 @@ async function writeExecutable(file: string, contents: string) {
 }
 
 async function sha256(file: string) {
-  const result = await run(["sha256sum", file])
-  if (result.code !== 0) throw new Error(result.stderr)
-  return result.stdout.split(/\s+/, 1)[0]
+  const contents = new Uint8Array(await Bun.file(file).arrayBuffer())
+  return createHash("sha256").update(contents).digest("hex")
 }
 
 async function makeFixture() {
@@ -127,6 +127,7 @@ cp "$source" "$output"
     ),
     HOME: home,
     PATH: `${fixtureBin}:${process.env.PATH ?? ""}`,
+    GITHUB_PATH: path.join(root, "github-path"),
     CURL_ARGS_LOG: curlArgs,
     CURL_FIXTURE_ROOT: fixtureData,
     SHELL: "/bin/bash",
@@ -445,6 +446,27 @@ describe("root installer", () => {
       expect((await fs.stat(await targetPath(fixture))).mode & 0o777).toBe(0o755)
       expect(await Bun.file(shellConfig).text()).toBe("export PATH=/usr/bin\n")
       expect(await curlCalls(fixture)).toEqual([])
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  test("writes the GitHub Actions path only inside the fixture", async () => {
+    const fixture = await makeFixture()
+    try {
+      const source = path.join(fixture.root, "local-opencode")
+      const githubPath = path.join(fixture.root, "github-path")
+      expect(fixture.env.GITHUB_PATH).toBe(githubPath)
+      await Bun.write(source, "local binary")
+
+      const result = await run(["bash", installer, "--binary", source, "--no-modify-path"], {
+        env: { ...fixture.env, GITHUB_ACTIONS: "true" },
+      })
+
+      expect(result.code).toBe(0)
+      expect(await Bun.file(await targetPath(fixture)).text()).toBe("local binary")
+      expect(await Bun.file(source).text()).toBe("local binary")
+      expect(await Bun.file(githubPath).text()).toBe(`${path.dirname(await targetPath(fixture))}\n`)
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true })
     }

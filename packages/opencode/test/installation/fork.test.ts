@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { mkdir, readdir, writeFile } from "node:fs/promises"
+import { chmod, link, lstat, mkdir, readFile, readdir, rename, rm, symlink, utimes, writeFile } from "node:fs/promises"
 import path from "node:path"
 import { gzipSync } from "node:zlib"
 import { Cause, Effect, Exit, Fiber, Layer } from "effect"
@@ -14,7 +14,10 @@ import { testEffect } from "../lib/effect"
 
 const it = testEffect(Layer.mergeAll(FetchHttpClient.layer, NodeFileSystem.layer, Layer.mock(AppProcess.Service, {})))
 const integration =
-  process.platform === "linux" && (process.arch === "x64" || process.arch === "arm64") ? it.live : it.live.skip
+  (process.platform === "linux" || process.platform === "darwin") &&
+  (process.arch === "x64" || process.arch === "arm64")
+    ? it.live
+    : it.live.skip
 const packageDirectory = path.resolve(import.meta.dir, "../..")
 
 const fixture = (options?: Parameters<typeof makeForkFixture>[0]) =>
@@ -84,6 +87,25 @@ describe("installation fork", () => {
     }),
   )
 
+  integration("rejects non-exact compiled test origins before network access", () =>
+    Effect.gen(function* () {
+      for (const suffix of ["\n", "\r\n", " ", "\t"]) {
+        const value = yield* fixture({ compileOrigin: `http://127.0.0.1:80${suffix}` })
+        const existingHttpClient = yield* HttpClient.HttpClient
+        const client = HttpClient.mapRequest(existingHttpClient, (request) =>
+          HttpClientRequest.setUrl(request, `${value.origin}${new URL(request.url).pathname}`),
+        )
+
+        const error = yield* value.compiled
+          .latest()
+          .pipe(Effect.provideService(HttpClient.HttpClient, client), Effect.flip)
+        expect(error, suffix).toBeInstanceOf(value.compiled.ForkUpdateError)
+        expect(error.message, suffix).toContain("Rejected insecure or untrusted update URL")
+        expect(value.requests, suffix).toEqual([])
+      }
+    }),
+  )
+
   integration("rejects invalid latest release metadata", () =>
     Effect.gen(function* () {
       const value = yield* fixture()
@@ -116,9 +138,49 @@ describe("installation fork", () => {
     }),
   )
 
+  integration("rejects a non-writable existing target before network access", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      yield* Effect.promise(() => value.seed("old binary"))
+      const original = yield* Effect.promise(() => readFile(value.target))
+      yield* Effect.promise(() => chmod(value.target, 0o444))
+
+      try {
+        const error = yield* value.compiled.upgrade("v1.2.3", value.target).pipe(Effect.flip)
+        expect(error).toBeInstanceOf(value.compiled.ForkUpdateError)
+        expect(yield* Effect.promise(() => readFile(value.target))).toEqual(original)
+        expect((yield* Effect.promise(() => lstat(value.target))).mode & 0o777).toBe(0o444)
+        expect(value.requests).toEqual([])
+        expect(yield* Effect.promise(value.staging)).toEqual([])
+      } finally {
+        yield* Effect.promise(() => chmod(value.target, 0o755))
+      }
+    }),
+  )
+
+  integration("rejects a read-only installation directory before network access", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      yield* Effect.promise(() => value.seed("old binary"))
+      const original = yield* Effect.promise(() => readFile(value.target))
+      const bin = path.dirname(value.target)
+      yield* Effect.promise(() => chmod(bin, 0o555))
+
+      try {
+        const error = yield* value.compiled.upgrade("v1.2.3", value.target).pipe(Effect.flip)
+        expect(error).toBeInstanceOf(value.compiled.ForkUpdateError)
+        expect(yield* Effect.promise(() => readFile(value.target))).toEqual(original)
+        expect(value.requests).toEqual([])
+        expect(yield* Effect.promise(value.staging)).toEqual([])
+      } finally {
+        yield* Effect.promise(() => chmod(bin, 0o755))
+      }
+    }),
+  )
+
   integration("installs a valid POSIX USTAR release archive", () =>
     Effect.gen(function* () {
-      const value = yield* fixture({ format: "ustar" })
+      const value = yield* fixture({ platform: "linux", libc: "glibc", format: "ustar" })
       yield* Effect.promise(() => value.seed("old binary"))
       yield* value.compiled.upgrade("v1.2.3", value.target)
 
@@ -261,7 +323,7 @@ describe("installation fork", () => {
 
   integration("rejects extra, directory, symlink, and traversal tar entries", () =>
     Effect.gen(function* () {
-      const value = yield* fixture()
+      const value = yield* fixture({ platform: "linux", libc: "glibc", format: "ustar" })
       for (const archive of [
         tarArchive([
           { name: "opencode", data: "new binary" },
@@ -337,6 +399,29 @@ describe("installation fork", () => {
     }),
   )
 
+  integration("rejects symlinked installation parents before network access", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      const installParent = path.dirname(path.dirname(value.target))
+      const external = path.join(value.root, "external-install")
+      yield* Effect.promise(() => mkdir(path.join(external, "bin"), { recursive: true }))
+      yield* Effect.promise(() => mkdir(path.dirname(installParent), { recursive: true }))
+      yield* Effect.promise(() => symlink(external, installParent))
+      yield* Effect.promise(() => value.seed("old binary"))
+
+      try {
+        const error = yield* value.compiled.upgrade("v1.2.3", value.target).pipe(Effect.flip)
+        expect(error).toBeInstanceOf(value.compiled.ForkUpdateError)
+        expect(error.message).toMatch(/symlink|parent/i)
+        expect(value.requests).toEqual([])
+        expect(new TextDecoder().decode(yield* Effect.promise(value.readTarget))).toBe("old binary")
+        expect(yield* Effect.promise(() => readdir(path.join(external, "bin")))).toEqual(["opencode"])
+      } finally {
+        yield* Effect.promise(() => rm(installParent, { force: true }))
+      }
+    }),
+  )
+
   integration("rejects a POSIX installation path with literal backslashes before network access", () =>
     Effect.gen(function* () {
       const value = yield* fixture()
@@ -381,7 +466,7 @@ describe("installation fork", () => {
 
   integration("rejects a compile-defined musl target before network access", () =>
     Effect.gen(function* () {
-      const value = yield* fixture({ libc: "musl" })
+      const value = yield* fixture({ platform: "linux", libc: "musl", format: "ustar" })
       yield* Effect.promise(() => value.seed("old binary"))
 
       const error = yield* value.compiled.upgrade("v1.2.3", value.target).pipe(Effect.flip)
@@ -406,6 +491,115 @@ describe("installation fork", () => {
       expect(value.requests).toEqual([])
       expect(new TextDecoder().decode(yield* Effect.promise(value.readTarget))).toBe("old binary")
       expect(yield* Effect.promise(value.staging)).toEqual([])
+    }),
+  )
+
+  integration("preserves a replacement target when it changes during archive download", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      yield* Effect.promise(() => value.seed("old binary"))
+      const blocked = value.blockArchive()
+      const fiber = yield* value.compiled
+        .upgrade("v1.2.3", value.target)
+        .pipe(Effect.exit, Effect.forkScoped({ startImmediately: true }))
+      yield* Effect.promise(() => blocked.ready)
+
+      const replacement = path.join(value.root, "external-replacement")
+      yield* Effect.promise(async () => {
+        await writeFile(replacement, "external replacement")
+        await chmod(replacement, 0o755)
+        await rename(replacement, value.target)
+      })
+      blocked.release()
+
+      const result = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(result)).toBe(true)
+      if (Exit.isSuccess(result)) {
+        const exit = result.value
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          const error = Cause.squash(exit.cause)
+          expect(error).toBeInstanceOf(value.compiled.ForkUpdateError)
+        }
+      }
+      expect(new TextDecoder().decode(yield* Effect.promise(value.readTarget))).toBe("external replacement")
+      expect(yield* Effect.promise(value.staging)).toEqual([])
+    }),
+  )
+
+  integration("preserves an in-place target change with the same size during archive download", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      yield* Effect.promise(() => value.seed("old binary"))
+      const before = yield* Effect.promise(() => lstat(value.target, { bigint: true }))
+      const blocked = value.blockArchive()
+      const fiber = yield* value.compiled
+        .upgrade("v1.2.3", value.target)
+        .pipe(Effect.exit, Effect.forkScoped({ startImmediately: true }))
+      yield* Effect.promise(() => blocked.ready)
+
+      yield* Effect.promise(() => writeFile(value.target, "bad binary"))
+      const changedAt = new Date(Number(before.mtimeNs / 1_000_000n + 1_000n))
+      yield* Effect.promise(() => utimes(value.target, changedAt, changedAt))
+      const changed = yield* Effect.promise(() => lstat(value.target, { bigint: true }))
+      expect(changed.size).toBe(before.size)
+      expect(changed.mtimeNs).toBeGreaterThan(before.mtimeNs)
+      blocked.release()
+
+      const result = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(result)).toBe(true)
+      if (Exit.isSuccess(result)) {
+        const exit = result.value
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          const error = Cause.squash(exit.cause)
+          expect(error).toBeInstanceOf(value.compiled.ForkUpdateError)
+        }
+      }
+      expect(new TextDecoder().decode(yield* Effect.promise(value.readTarget))).toBe("bad binary")
+      expect(yield* Effect.promise(value.staging)).toEqual([])
+    }),
+  )
+
+  integration("rejects a destination parent replacement without touching its replacement stage", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      yield* Effect.promise(() => value.seed("old binary"))
+      const blocked = value.blockArchive()
+      const fiber = yield* value.compiled
+        .upgrade("v1.2.3", value.target)
+        .pipe(Effect.exit, Effect.forkScoped({ startImmediately: true }))
+      yield* Effect.promise(() => blocked.ready)
+
+      const stages = yield* Effect.promise(value.staging)
+      expect(stages).toHaveLength(1)
+      const stageName = stages[0]
+      const originalBin = path.dirname(value.target)
+      const backupBin = path.join(value.root, "original-bin")
+      const sentinel = path.join(originalBin, stageName, "opencode")
+      yield* Effect.promise(async () => {
+        await rename(originalBin, backupBin)
+        await mkdir(originalBin, { recursive: true })
+        await link(path.join(backupBin, "opencode"), value.target)
+        await mkdir(path.dirname(sentinel), { recursive: true })
+        await writeFile(sentinel, "sentinel")
+      })
+      blocked.release()
+
+      const result = yield* Fiber.await(fiber)
+      expect(Exit.isSuccess(result)).toBe(true)
+      if (Exit.isSuccess(result)) {
+        const exit = result.value
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          const error = Cause.squash(exit.cause)
+          expect(error).toBeInstanceOf(value.compiled.ForkUpdateError)
+          if (error instanceof value.compiled.ForkUpdateError)
+            expect(error.message).toMatch(/parent|directory|changed/i)
+        }
+      }
+      expect(new TextDecoder().decode(yield* Effect.promise(value.readTarget))).toBe("old binary")
+      expect(yield* Effect.promise(() => readFile(sentinel, "utf8"))).toBe("sentinel")
     }),
   )
 

@@ -52,8 +52,8 @@ export function getReleaseType(current: string, latest: string): ReleaseType {
 export function decideUpdate(input: UpdatePolicyInput): UpdateDecision {
   if (input.autoupdate === false) return "noop"
 
-  const current = Fork.stableVersion(input.current)
-  const latest = Fork.stableVersion(input.latest)
+  const current = Fork.IS_FORK ? Fork.stableVersion(input.current) : semver.valid(input.current)
+  const latest = Fork.IS_FORK ? Fork.stableVersion(input.latest) : semver.valid(input.latest)
   if (!current || !latest || !semver.gt(latest, current)) return "noop"
 
   if (input.alwaysNotify || input.autoupdate === "notify") return "notify"

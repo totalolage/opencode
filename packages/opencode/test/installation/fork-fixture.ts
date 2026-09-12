@@ -215,7 +215,7 @@ async function createArchive(
       ? ["/usr/bin/zip", "-q", archivePath, "opencode"]
       : [
           "/usr/bin/tar",
-          ...(format === "ustar" ? ["--format=ustar"] : []),
+          ...(format === "gnu" ? ["--format=gnu"] : ["--format=ustar"]),
           "-czf",
           archivePath,
           "-C",
