@@ -1,6 +1,8 @@
 declare global {
   const OPENCODE_VERSION: string
   const OPENCODE_CHANNEL: string
+  const OPENCODE_DISTRIBUTION: string
+  const OPENCODE_UPDATE_TEST_ORIGIN: string
 }
 
 export const InstallationVersion = typeof OPENCODE_VERSION === "string" ? OPENCODE_VERSION : "local"

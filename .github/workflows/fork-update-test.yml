@@ -1,0 +1,52 @@
+name: fork-update-test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: fork-update-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.name }})
+    if: github.repository == 'totalolage/opencode'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: ubuntu-24.04
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: darwin-x64
+            runner: macos-15-intel
+          - name: darwin-arm64
+            runner: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Run focused installation tests
+        working-directory: packages/opencode
+        run: bun test test/installation --timeout 30000
+
+      - name: Verify fork upgrade
+        working-directory: packages/opencode
+        run: bun run script/verify-fork-upgrade.ts
+        timeout-minutes: 30

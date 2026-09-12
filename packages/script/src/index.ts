@@ -22,7 +22,26 @@ const env = {
   OPENCODE_BUMP: process.env["OPENCODE_BUMP"],
   OPENCODE_VERSION: process.env["OPENCODE_VERSION"],
   OPENCODE_RELEASE: process.env["OPENCODE_RELEASE"],
+  OPENCODE_UPSTREAM_BUILD: process.env["OPENCODE_UPSTREAM_BUILD"],
+  OPENCODE_FORK_RELEASE: process.env["OPENCODE_FORK_RELEASE"],
+  OPENCODE_FORK_TEST_ORIGIN: process.env["OPENCODE_FORK_TEST_ORIGIN"],
 }
+const IS_UPSTREAM_BUILD = env.OPENCODE_UPSTREAM_BUILD === "1"
+const IS_FORK_RELEASE = env.OPENCODE_FORK_RELEASE === "1"
+
+if (IS_UPSTREAM_BUILD && IS_FORK_RELEASE) {
+  throw new Error("OPENCODE_FORK_RELEASE=1 cannot be used with OPENCODE_UPSTREAM_BUILD=1")
+}
+
+if (IS_FORK_RELEASE) {
+  if (!env.OPENCODE_VERSION || !isStrictStableVersion(env.OPENCODE_VERSION)) {
+    throw new Error("OPENCODE_VERSION must be an explicit stable X.Y.Z version for OPENCODE_FORK_RELEASE=1")
+  }
+  if (env.OPENCODE_CHANNEL !== "latest") {
+    throw new Error("OPENCODE_CHANNEL=latest is required for OPENCODE_FORK_RELEASE=1")
+  }
+}
+
 const CHANNEL = await (async () => {
   if (env.OPENCODE_CHANNEL) return env.OPENCODE_CHANNEL
   if (env.OPENCODE_BUMP) return "latest"
@@ -33,7 +52,8 @@ const IS_PREVIEW = CHANNEL !== "latest"
 
 const VERSION = await (async () => {
   if (env.OPENCODE_VERSION) return env.OPENCODE_VERSION
-  if (IS_PREVIEW) return `0.0.0-${CHANNEL}-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`
+  if (!IS_UPSTREAM_BUILD || IS_PREVIEW)
+    return `0.0.0-${CHANNEL}-${new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "")}`
   const version = await fetch("https://registry.npmjs.org/opencode-ai/latest")
     .then((res) => {
       if (!res.ok) throw new Error(res.statusText)
@@ -46,6 +66,8 @@ const VERSION = await (async () => {
   if (t === "minor") return `${major}.${minor + 1}.0`
   return `${major}.${minor}.${patch + 1}`
 })()
+const DISTRIBUTION = IS_UPSTREAM_BUILD ? "upstream" : "totalolage/opencode"
+const FORK_TEST_ORIGIN = env.OPENCODE_FORK_TEST_ORIGIN ?? ""
 
 const bot = ["actions-user", "opencode", "opencode-agent[bot]"]
 const teamPath = path.resolve(import.meta.dir, "../../../.github/TEAM_MEMBERS")
@@ -58,6 +80,18 @@ const team = [
 ]
 
 export const Script = {
+  get upstream() {
+    return IS_UPSTREAM_BUILD
+  },
+  get forkRelease() {
+    return IS_FORK_RELEASE
+  },
+  get distribution() {
+    return DISTRIBUTION
+  },
+  get forkTestOrigin() {
+    return FORK_TEST_ORIGIN
+  },
   get channel() {
     return CHANNEL
   },
@@ -75,3 +109,7 @@ export const Script = {
   },
 }
 console.log(`opencode script`, JSON.stringify(Script, null, 2))
+
+function isStrictStableVersion(value: string) {
+  return /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value) && semver.valid(value) === value
+}

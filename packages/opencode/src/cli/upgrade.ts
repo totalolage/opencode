@@ -12,7 +12,17 @@ export async function upgrade() {
   const latest = await Installation.latest(method).catch(() => {})
   if (!latest) return
 
-  if (Flag.OPENCODE_ALWAYS_NOTIFY_UPDATE) {
+  const decision = Installation.decideUpdate({
+    current: InstallationVersion,
+    latest,
+    method,
+    autoupdate: config.autoupdate,
+    alwaysNotify: Flag.OPENCODE_ALWAYS_NOTIFY_UPDATE,
+  })
+
+  if (decision === "noop") return
+
+  if (decision === "notify") {
     GlobalBus.emit("event", {
       directory: "global",
       payload: {
@@ -23,22 +33,6 @@ export async function upgrade() {
     return
   }
 
-  if (InstallationVersion === latest) return
-
-  const kind = Installation.getReleaseType(InstallationVersion, latest)
-
-  if (config.autoupdate === "notify" || kind !== "patch") {
-    GlobalBus.emit("event", {
-      directory: "global",
-      payload: {
-        type: Installation.Event.UpdateAvailable.type,
-        properties: { version: latest },
-      },
-    })
-    return
-  }
-
-  if (method === "unknown") return
   await Installation.upgrade(method, latest)
     .then(() =>
       GlobalBus.emit("event", {

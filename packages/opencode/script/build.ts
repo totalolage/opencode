@@ -4,6 +4,8 @@ import { $ } from "bun"
 import path from "path"
 import { fileURLToPath } from "url"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
+import { Script } from "@opencode-ai/script"
+import pkg from "../package.json"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -11,10 +13,19 @@ const dir = path.resolve(__dirname, "..")
 
 process.chdir(dir)
 
-const generated = await import("./generate.ts")
+const forkUpdateTestFlag = process.argv.includes("--fork-update-test")
+const forkTestOrigin = process.env.OPENCODE_FORK_TEST_ORIGIN
+if (forkTestOrigin !== undefined && !forkUpdateTestFlag) {
+  throw new Error("OPENCODE_FORK_TEST_ORIGIN requires --fork-update-test")
+}
+if (forkTestOrigin !== undefined && !isForkTestOrigin(forkTestOrigin)) {
+  throw new Error("OPENCODE_FORK_TEST_ORIGIN must be http://127.0.0.1:PORT without a path, credentials, query, or hash")
+}
+if (forkUpdateTestFlag && Script.release) {
+  throw new Error("--fork-update-test cannot be used in release mode")
+}
 
-import { Script } from "@opencode-ai/script"
-import pkg from "../package.json"
+const generated = await import("./generate.ts")
 
 const singleFlag = process.argv.includes("--single")
 const baselineFlag = process.argv.includes("--baseline")
@@ -113,11 +124,20 @@ const allTargets: {
   },
 ]
 
+const forkReleaseTargets = allTargets.filter((item) => {
+  if (item.os === "linux") return item.abi === undefined && (item.arch === "arm64" || item.avx2 === false)
+  if (item.os === "darwin")
+    return item.abi === undefined && (item.arch === "arm64" || (item.arch === "x64" && item.avx2 === false))
+  return false
+})
+const buildTargets = Script.forkRelease ? forkReleaseTargets : allTargets
 const targets = singleFlag
-  ? allTargets.filter((item) => {
+  ? buildTargets.filter((item) => {
       if (item.os !== process.platform || item.arch !== process.arch) {
         return false
       }
+
+      if (Script.forkRelease) return true
 
       // When building for the current platform, prefer a single native binary by default.
       // Baseline binaries require additional Bun artifacts and can be flaky to download.
@@ -132,7 +152,7 @@ const targets = singleFlag
 
       return true
     })
-  : allTargets
+  : buildTargets
 
 await $`rm -rf dist`
 
@@ -192,10 +212,12 @@ for (const item of targets) {
     define: {
       FFF_LIBC: JSON.stringify(item.abi === "musl" ? "musl" : "gnu"),
       OPENCODE_VERSION: `'${Script.version}'`,
+      OPENCODE_DISTRIBUTION: JSON.stringify(Script.distribution),
       OPENCODE_MODELS_DEV: generated.modelsData,
       OTUI_TREE_SITTER_WORKER_PATH: bunfsRoot + treeSitterWorkerPath,
       OPENCODE_WORKER_PATH: workerPath,
       OPENCODE_CHANNEL: `'${Script.channel}'`,
+      OPENCODE_UPDATE_TEST_ORIGIN: JSON.stringify(forkTestOrigin ?? ""),
       OPENCODE_LIBC: item.os === "linux" ? `'${item.abi ?? "glibc"}'` : "",
       ...(item.os === "linux" ? { "process.env.OPENTUI_LIBC": JSON.stringify(item.abi ?? "glibc") } : {}),
     },
@@ -240,7 +262,16 @@ if (Script.release) {
       await $`zip -r ../../${key}.zip *`.cwd(`dist/${key}/bin`)
     }
   }
+}
+
+if (Script.release && Script.upstream) {
   await $`gh release upload v${Script.version} ./dist/*.zip ./dist/*.tar.gz --clobber --repo ${process.env.GH_REPO}`
 }
 
 export { binaries }
+
+function isForkTestOrigin(value: string) {
+  const match = /^http:\/\/127\.0\.0\.1:([1-9]\d{0,4})$/.exec(value)
+  if (!match || match[0] !== value) return false
+  return Number(match[1]) <= 65535
+}
