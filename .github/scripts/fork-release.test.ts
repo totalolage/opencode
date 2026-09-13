@@ -10,6 +10,44 @@ import {
   verifyReleaseArtifacts,
   writeSha256Sums,
 } from "./fork-release"
+import { parse } from "../../packages/script/src/version"
+
+describe("fork version parser", () => {
+  test("accepts stable and suffix versions", () => {
+    expect(parse("0.0.0")).toBe("0.0.0")
+    expect(parse("1.18.30-f8y-20260913140000")).toBe("1.18.30-f8y-20260913140000")
+    expect(parse("1.2.3-f8y-20240229120000")).toBe("1.2.3-f8y-20240229120000")
+    expect(parse("v1.2.3")).toBe("1.2.3")
+  })
+
+  test("rejects invalid versions", () => {
+    for (const input of [
+      "1.2.3-f8y-20230229120000", // invalid leap date
+      "1.2.3-f8y-202402291200", // not 14 digits
+      "1.2.3-f8y-00000101000000", // year 0000
+      "1.2.3-f8y-20261331120000", // invalid month/day
+      "1.2.3-f8y-20260913240000", // hour 24
+      "1.2.3-f8y-20260913120060", // second 60
+      "01.2.3", // leading zero core
+      "1.2.3-alpha.1", // arbitrary prerelease
+      "1.2.3+build", // build metadata
+      "99999999999999999999.0.0", // unsafe integer core
+      "1.2.3\n", // trailing newline
+      "1.2", // incomplete
+      "1.2.3-f8y", // incomplete suffix
+    ]) {
+      expect(parse(input)).toBeUndefined()
+    }
+  })
+
+  test("release and build inputs must be strictly normalized", () => {
+    expect(validateVersion("1.18.30-f8y-20260913140000")).toBe("1.18.30-f8y-20260913140000")
+    expect(validateVersion("0.0.0")).toBe("0.0.0")
+    expect(() => validateVersion("v1.2.3")).toThrow()
+    expect(() => validateVersion("v1.18.30-f8y-20260913140000")).toThrow()
+    expect(() => validateVersion("1.2.3-f8y-20230229120000")).toThrow()
+  })
+})
 
 describe("fork release workflow", () => {
   test("accepts only stable X.Y.Z versions", () => {
@@ -116,5 +154,18 @@ describe("fork release workflow", () => {
     expect(inputs.ref.default).toBe("dev")
     expect(inputs.publish.default).toBe(false)
     expect(inputs.publish.type).toBe("boolean")
+    expect(inputs.version.description).toContain("X.Y.Z-f8y-")
+  })
+
+  test("ties the GitHub prerelease flag to the version suffix", async () => {
+    const workflowPath = path.join(import.meta.dir, "../workflows/fork-release.yml")
+    const publish = await Bun.file(workflowPath).text().then((text) =>
+      text.slice(text.indexOf("  publish:")),
+    )
+
+    expect(publish).toContain('if [[ "$RELEASE_VERSION" == *-f8y-* ]]; then')
+    expect(publish).toContain("prerelease=true")
+    expect(publish).toContain("prerelease=false")
+    expect(publish).toContain('--prerelease="${{ steps.meta.outputs.prerelease }}"')
   })
 })

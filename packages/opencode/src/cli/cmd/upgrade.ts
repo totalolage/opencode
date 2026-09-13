@@ -121,7 +121,7 @@ async function upgradeFork(input: { target?: string; method?: string; detectedMe
   if (!target) return
 
   if (decision.type === "upgrade") {
-    const current = Fork.stableVersion(InstallationVersion)
+    const current = Fork.supportedVersion(InstallationVersion)
     if (current && semver.eq(current, target)) {
       prompts.log.warn(`opencode upgrade skipped: ${target} is already installed`)
       prompts.outro("Done")

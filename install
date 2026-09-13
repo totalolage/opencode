@@ -38,6 +38,165 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || fail "'$1' is required but was not found"
 }
 
+# Single source of truth for version syntax, release metadata validation, and
+# release ordering. Version tuples are (major, minor, patch, stable?1:0,
+# timestamp string) so stable beats a suffix on the same base, timestamps
+# order ascending, and a higher core always sorts first.
+python_version_tool() {
+    python3 - "$@" <<'PY'
+import datetime
+import json
+import re
+import sys
+
+MAX_SAFE_CORE = 9007199254740991
+SUFFIX_SEPARATOR = "-f8y-"
+
+
+def parse_core(text):
+    if re.fullmatch(r"(0|[1-9][0-9]*)", text) is None:
+        return None
+    value = int(text)
+    if value > MAX_SAFE_CORE:
+        return None
+    return value
+
+
+def parse_timestamp(text):
+    if re.fullmatch(r"[0-9]{14}", text) is None:
+        return None
+    try:
+        datetime.datetime(
+            int(text[0:4]),
+            int(text[4:6]),
+            int(text[6:8]),
+            int(text[8:10]),
+            int(text[10:12]),
+            int(text[12:14]),
+        )
+    except ValueError:
+        return None
+    return text
+
+
+def parse_version(value, require_v_prefix):
+    if require_v_prefix:
+        if not value.startswith("v"):
+            return None
+        body = value[1:]
+    else:
+        body = value[1:] if value.startswith("v") else value
+    core_part, separator, remainder = body.partition(SUFFIX_SEPARATOR)
+    stable = 1
+    suffix = ""
+    if separator:
+        stable = 0
+        suffix = parse_timestamp(remainder)
+        if suffix is None:
+            return None
+    parts = core_part.split(".")
+    if len(parts) != 3:
+        return None
+    core = [parse_core(part) for part in parts]
+    if None in core:
+        return None
+    return (core[0], core[1], core[2], stable, suffix)
+
+
+def canonical(version):
+    core = ".".join(str(component) for component in version[0:3])
+    if version[3] == 1:
+        return core
+    return core + SUFFIX_SEPARATOR + version[4]
+
+
+def load_json_file(path):
+    try:
+        with open(path, encoding="utf-8") as source:
+            return json.load(source)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise SystemExit(1)
+
+
+def main():
+    mode = sys.argv[1]
+    if mode == "parse-cli":
+        version = parse_version(sys.argv[2], False)
+        if version is None:
+            raise SystemExit(1)
+        print(canonical(version))
+    elif mode == "parse-tag":
+        version = parse_version(sys.argv[2], True)
+        if version is None:
+            raise SystemExit(1)
+        print(canonical(version))
+    elif mode == "compare":
+        left = parse_version(sys.argv[2], False)
+        right = parse_version(sys.argv[3], False)
+        if left is None or right is None:
+            raise SystemExit(1)
+        if left < right:
+            print("-1")
+        elif left > right:
+            print("1")
+        else:
+            print("0")
+    elif mode == "pinned":
+        release = load_json_file(sys.argv[2])
+        if not isinstance(release, dict):
+            raise SystemExit(1)
+        tag = release.get("tag_name")
+        if not isinstance(tag, str) or tag != sys.argv[3]:
+            raise SystemExit(1)
+        if release.get("draft") is not False:
+            raise SystemExit(1)
+        version = parse_version(tag, True)
+        if version is None:
+            raise SystemExit(1)
+        if release.get("prerelease") is not (version[3] == 0):
+            raise SystemExit(1)
+        print(canonical(version))
+    elif mode == "count":
+        releases = load_json_file(sys.argv[2])
+        if not isinstance(releases, list):
+            raise SystemExit(1)
+        print(len(releases))
+    elif mode == "latest":
+        best = None
+        for path in sys.argv[2:]:
+            releases = load_json_file(path)
+            if not isinstance(releases, list):
+                raise SystemExit(1)
+            for release in releases:
+                if not isinstance(release, dict):
+                    raise SystemExit(1)
+                tag = release.get("tag_name")
+                if not isinstance(tag, str):
+                    raise SystemExit(1)
+                draft = release.get("draft")
+                prerelease = release.get("prerelease")
+                if not isinstance(draft, bool) or not isinstance(prerelease, bool):
+                    raise SystemExit(1)
+                if draft:
+                    continue
+                version = parse_version(tag, True)
+                if version is None:
+                    continue
+                if prerelease is not (version[3] == 0):
+                    continue
+                if best is None or version > best:
+                    best = version
+        if best is None:
+            raise SystemExit(1)
+        print(canonical(best))
+    else:
+        raise SystemExit(1)
+
+
+main()
+PY
+}
+
 identity() {
     stat -c '%d:%i' "$1" 2>/dev/null || stat -f '%d:%i' "$1"
 }
@@ -91,10 +250,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -n "$requested_version" ]]; then
-    if [[ ! "$requested_version" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-        fail "version must be a stable X.Y.Z version without prerelease or build metadata"
+    require_command python3
+    if ! canonical_version=$(python_version_tool parse-cli "$requested_version"); then
+        fail "version must be a stable X.Y.Z version or a strict X.Y.Z-f8y-YYYYMMDDHHMMSS version without prerelease or build metadata"
     fi
-    requested_version="${requested_version#v}"
+    requested_version="$canonical_version"
 fi
 
 [[ -n "${HOME:-}" ]] || fail "HOME is not set"
@@ -242,51 +402,42 @@ if [[ -n "$binary_path" ]]; then
     printf '%b\n' "${MUTED}Installing $APP from: $binary_path${NC}"
     cp "$binary_path" "$staging_dir/$APP" || fail "unable to stage local binary"
 else
-    metadata_url="https://api.github.com/repos/$OWNER/$REPOSITORY/releases/latest"
-    expected_tag=""
+    releases_api_url="https://api.github.com/repos/$OWNER/$REPOSITORY/releases"
     if [[ -n "$requested_version" ]]; then
         expected_tag="v$requested_version"
-        metadata_url="https://api.github.com/repos/$OWNER/$REPOSITORY/releases/tags/$expected_tag"
-    fi
-
-    metadata_path="$staging_dir/release.json"
-    if ! curl --proto '=https' --proto-redir '=https' -fSL -o "$metadata_path" "$metadata_url"; then
-        fail "unable to fetch release metadata"
-    fi
-
-    if ! specific_version=$(
-        python3 - "$metadata_path" "$expected_tag" <<'PY'
-import json
-import re
-import sys
-
-try:
-    with open(sys.argv[1], encoding="utf-8") as metadata_file:
-        release = json.load(metadata_file)
-except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-    raise SystemExit(1)
-
-if not isinstance(release, dict):
-    raise SystemExit(1)
-
-tag = release.get("tag_name")
-if not isinstance(tag, str):
-    raise SystemExit(1)
-
-if release.get("draft") is not False or release.get("prerelease") is not False:
-    raise SystemExit(1)
-
-if sys.argv[2] and tag != sys.argv[2]:
-    raise SystemExit(1)
-
-match = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag)
-if match is None:
-    raise SystemExit(1)
-
-print(tag[1:])
-PY
-    ); then
-        fail "release metadata must describe an exact stable, non-draft release"
+        metadata_url="$releases_api_url/tags/$expected_tag"
+        metadata_path="$staging_dir/release.json"
+        if ! curl --proto '=https' --proto-redir '=https' -fSL -o "$metadata_path" "$metadata_url"; then
+            fail "unable to fetch release metadata"
+        fi
+        if ! specific_version=$(python_version_tool pinned "$metadata_path" "$expected_tag"); then
+            fail "release metadata must describe an exact stable or strict suffix release matching the requested version"
+        fi
+    else
+        # Discovery uses only the fixed repository and explicit page URLs;
+        # Link headers and any other source are never followed.
+        page=1
+        declare -a release_pages=()
+        while :; do
+            page_path="$staging_dir/releases-$page.json"
+            if ! curl --proto '=https' --proto-redir '=https' -fSL -o "$page_path" "$releases_api_url?per_page=100&page=$page"; then
+                fail "unable to fetch release list page $page"
+            fi
+            if ! page_count=$(python_version_tool count "$page_path"); then
+                fail "release list page $page is malformed"
+            fi
+            release_pages+=("$page_path")
+            if (( page_count < 100 )); then
+                break
+            fi
+            if (( page >= 100 )); then
+                fail "release list exceeded 100 pages"
+            fi
+            page=$((page + 1))
+        done
+        if ! specific_version=$(python_version_tool latest "${release_pages[@]}"); then
+            fail "no supported release found in the release list"
+        fi
     fi
 
     if [[ -z "$requested_version" && "$target_present" == "true" ]]; then
@@ -297,30 +448,13 @@ PY
         fi
         verify_install_state
 
-        if ! version_comparison=$(
-            python3 - "$specific_version" "$current_version" <<'PY'
-import re
-import sys
-
-pattern = re.compile(r"^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
-
-def parse_version(value):
-    match = pattern.fullmatch(value)
-    if match is None:
-        raise SystemExit(1)
-    return tuple(int(component) for component in match.groups())
-
-latest = parse_version(sys.argv[1])
-current = parse_version(sys.argv[2])
-if latest < current:
-    print("-1")
-elif latest > current:
-    print("1")
-else:
-    print("0")
-PY
-        ); then
+        if ! current_canonical_version=$(python_version_tool parse-cli "$current_version"); then
             fail "installed target version is not a strict stable X.Y.Z version; rerun with --version X.Y.Z or --binary /path/to/opencode"
+        fi
+        verify_install_state
+
+        if ! version_comparison=$(python_version_tool compare "$specific_version" "$current_canonical_version"); then
+            fail "unable to compare the installed target version"
         fi
         verify_install_state
 

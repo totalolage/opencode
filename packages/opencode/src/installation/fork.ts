@@ -4,8 +4,8 @@ import type { BigIntStats } from "node:fs"
 import { basename, dirname, join } from "node:path"
 import { gunzipSync } from "node:zlib"
 import type { Entry } from "@zip.js/zip.js"
-import semver from "semver"
 import { Effect, FileSystem, Schema } from "effect"
+import { ForkVersion } from "@opencode-ai/script/version"
 import type { AppProcess } from "@opencode-ai/core/process"
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 
@@ -49,13 +49,42 @@ type Asset = {
   readonly format: ArchiveFormat
 }
 
-export function stableVersion(input: string): string | undefined {
+// Accepts a strict stable X.Y.Z or fork release X.Y.Z-f8y-<14 digit UTC timestamp>
+// with an optional leading "v"; delegates validation to the shared parser.
+export function supportedVersion(input: string): string | undefined {
   if (typeof input !== "string") return undefined
-  const match = /^(?:v)?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.exec(input)
-  if (!match || match[0] !== input) return undefined
+  return ForkVersion.parse(input)
+}
 
-  const version = `${match[1]}.${match[2]}.${match[3]}`
-  return semver.valid(version) === version ? version : undefined
+// Stable base outranks a timestamped release on the same core; timestamps of
+// equal length compare lexicographically; a higher core always wins.
+export function compareVersions(a: string, b: string): number {
+  const left = versionParts(a)
+  const right = versionParts(b)
+  for (let index = 0; index < 3; index++) {
+    if (left[index] !== right[index]) return left[index] < right[index] ? -1 : 1
+  }
+  const leftTimestamp = timestampOf(a)
+  const rightTimestamp = timestampOf(b)
+  if (leftTimestamp === rightTimestamp) return 0
+  if (leftTimestamp === undefined) return 1
+  if (rightTimestamp === undefined) return -1
+  return leftTimestamp < rightTimestamp ? -1 : 1
+}
+
+function versionParts(version: string) {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(version)
+  if (!match) return [0, 0, 0]
+  return [Number(match[1]), Number(match[2]), Number(match[3])]
+}
+
+function timestampOf(version: string) {
+  const match = /-f8y-(\d{14})$/.exec(version)
+  return match?.[1]
+}
+
+function isTimestamped(version: string) {
+  return timestampOf(version) !== undefined
 }
 
 export function method(execPath: string): "curl" | "unknown" {
@@ -67,15 +96,51 @@ export function method(execPath: string): "curl" | "unknown" {
   return "curl"
 }
 
+const pageSize = 100
+const maxPages = 100
+
 export function latest(): Effect.Effect<string, ForkUpdateError, HttpClient.HttpClient> {
   return Effect.gen(function* () {
     const http = yield* HttpClient.HttpClient
-    const response = yield* request(http, `${metadataOrigin()}/repos/${repository}/releases/latest`, "metadata")
-    const release = yield* decodeRelease(response)
-    const validation = validateRelease(release)
-    if (validation instanceof ForkUpdateError) return yield* validation
-    return validation
+    const eligible: string[] = []
+    for (let page = 1; page <= maxPages; page++) {
+      const response = yield* request(
+        http,
+        `${metadataOrigin()}/repos/${repository}/releases?per_page=${pageSize}&page=${page}`,
+        "metadata",
+      )
+      const releases = yield* HttpClientResponse.schemaBodyJson(Schema.Array(ReleaseMetadata))(response).pipe(
+        Effect.mapError(toForkUpdateError),
+      )
+      for (const release of releases) {
+        const version = eligibleVersion(release)
+        if (version !== undefined) eligible.push(version)
+      }
+      if (releases.length < pageSize) {
+        const selected = selectLatest(eligible)
+        if (selected instanceof ForkUpdateError) return yield* selected
+        return selected
+      }
+    }
+    return yield* new ForkUpdateError({ message: `Fork release listing exceeded ${maxPages} pages` })
   }).pipe(Effect.mapError(toForkUpdateError))
+}
+
+function selectLatest(versions: ReadonlyArray<string>): string | ForkUpdateError {
+  let best: string | undefined
+  for (const version of versions) {
+    if (best === undefined || compareVersions(version, best) > 0) best = version
+  }
+  if (best === undefined) return new ForkUpdateError({ message: "No eligible fork release found" })
+  return best
+}
+
+function eligibleVersion(release: Schema.Schema.Type<typeof ReleaseMetadata>): string | undefined {
+  const version = releaseVersion(release.tag_name)
+  if (version === undefined) return undefined
+  if (release.draft !== false) return undefined
+  if (release.prerelease !== isTimestamped(version)) return undefined
+  return version
 }
 
 export function upgrade(
@@ -88,7 +153,7 @@ export function upgrade(
         yield* new ForkUpdateError({ message: `Unsupported fork installation path: ${execPath}. ${INSTRUCTIONS}` })
       }
 
-      const version = stableVersion(target)
+      const version = supportedVersion(target)
       if (version === undefined) {
         return yield* new ForkUpdateError({ message: `Invalid fork release version: ${target}` })
       }
@@ -275,7 +340,7 @@ function fetchRelease(http: HttpClient.HttpClient, version: string) {
 }
 
 function releaseVersion(tag: string) {
-  const version = stableVersion(tag)
+  const version = supportedVersion(tag)
   if (version === undefined || tag !== `v${version}`) return undefined
   return version
 }
@@ -291,8 +356,10 @@ function validateRelease(
   if (release.draft !== false) {
     return new ForkUpdateError({ message: `Release ${release.tag_name} is a draft` })
   }
-  if (release.prerelease !== false) {
-    return new ForkUpdateError({ message: `Release ${release.tag_name} is a prerelease` })
+  if (release.prerelease !== isTimestamped(version)) {
+    return new ForkUpdateError({
+      message: `Release ${release.tag_name} prerelease flag does not match the version`,
+    })
   }
   if (requested !== undefined && release.tag_name !== `v${requested}`) {
     return new ForkUpdateError({

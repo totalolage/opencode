@@ -84,8 +84,15 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$url" in
-  https://api.github.com/repos/totalolage/opencode/releases/latest)
-    source="$CURL_FIXTURE_ROOT/latest.json"
+  https://api.github.com/repos/totalolage/opencode/releases\\?per_page=100\\&page=*)
+    page="\${url##*page=}"
+    case "\$page" in
+      ''|*[!0-9]*)
+        printf 'unexpected URL: %s\n' "\$url" >&2
+        exit 1
+        ;;
+    esac
+    source="\$CURL_FIXTURE_ROOT/releases-\$page.json"
     ;;
   https://api.github.com/repos/totalolage/opencode/releases/tags/*)
     source="$CURL_FIXTURE_ROOT/pinned.json"
@@ -168,8 +175,15 @@ async function makeArchive(
   return { filename, archive }
 }
 
-async function writeRelease(fixture: Fixture, name: "latest" | "pinned", release: unknown) {
+async function writeRelease(fixture: Fixture, name: string, release: unknown) {
   await Bun.write(path.join(fixture.fixtureData, `${name}.json`), JSON.stringify(release))
+}
+
+const stableRelease = (version: string) => ({ tag_name: `v${version}`, draft: false, prerelease: false })
+const suffixOf = (version: string) => version.includes("-f8y-")
+
+async function defaultList(fixture: Fixture, version: string) {
+  await writeRelease(fixture, "releases-1", [stableRelease(version)])
 }
 
 async function targetPath(fixture: Fixture) {
@@ -275,7 +289,7 @@ describe("root installer", () => {
   test("installs the latest Linux release from the fixed GitHub repository", async () => {
     const fixture = await makeFixture()
     try {
-      await writeRelease(fixture, "latest", { tag_name: "v1.2.3", draft: false, prerelease: false })
+      await defaultList(fixture, "1.2.3")
       await makeArchive(fixture, { platform: "linux", arch: "x64", contents: { opencode: "latest binary" } })
 
       const result = await run(["bash", installer, "--no-modify-path"], {
@@ -292,7 +306,7 @@ describe("root installer", () => {
 
       const calls = await curlCalls(fixture)
       expect(calls.map((args) => args.at(-1))).toEqual([
-        "https://api.github.com/repos/totalolage/opencode/releases/latest",
+        "https://api.github.com/repos/totalolage/opencode/releases?per_page=100&page=1",
         "https://github.com/totalolage/opencode/releases/download/v1.2.3/opencode-linux-x64.tar.gz",
         "https://github.com/totalolage/opencode/releases/download/v1.2.3/SHA256SUMS",
       ])
@@ -330,11 +344,69 @@ describe("root installer", () => {
     }
   })
 
+  test("accepts strict suffix versions including boundary timestamps when pinned", async () => {
+    for (const version of [
+      "1.18.30-f8y-20260913140000",
+      "1.18.30-f8y-20240229235959",
+      "1.18.30-f8y-00011231000000",
+      "9007199254740991.0.0",
+    ]) {
+      const fixture = await makeFixture()
+      try {
+        await writeRelease(fixture, "pinned", {
+          tag_name: `v${version}`,
+          draft: false,
+          prerelease: suffixOf(version),
+        })
+        await makeArchive(fixture, { platform: "linux", arch: "x64", contents: { opencode: `suffix ${version}` } })
+
+        const result = await run(["bash", installer, "--version", version, "--no-modify-path"], { env: fixture.env })
+
+        expect(result.code, version).toBe(0)
+        expect(await Bun.file(await targetPath(fixture)).text(), version).toBe(`suffix ${version}`)
+        expect((await curlCalls(fixture)).map((args) => args.at(-1)), version).toEqual([
+          `https://api.github.com/repos/totalolage/opencode/releases/tags/v${version}`,
+          `https://github.com/totalolage/opencode/releases/download/v${version}/opencode-linux-x64.tar.gz`,
+          `https://github.com/totalolage/opencode/releases/download/v${version}/SHA256SUMS`,
+        ])
+      } finally {
+        await fs.rm(fixture.root, { recursive: true, force: true })
+      }
+    }
+  })
+
+  test("rejects pinned releases with mismatched draft or prerelease flags", async () => {
+    const cases = [
+      { version: "1.2.3", release: { tag_name: "v1.2.3", draft: false, prerelease: true } },
+      { version: "1.2.3", release: { tag_name: "v1.2.3", draft: true, prerelease: false } },
+      { version: "1.2.3-f8y-20260913140000", release: { tag_name: "v1.2.3-f8y-20260913140000", draft: false, prerelease: false } },
+      { version: "1.2.3-f8y-20260913140000", release: { tag_name: "v1.2.3-f8y-20260913140000", draft: true, prerelease: true } },
+    ]
+
+    for (const item of cases) {
+      const fixture = await makeFixture()
+      try {
+        await writeRelease(fixture, "pinned", item.release)
+        const result = await expectInstallFailurePreservesTarget(fixture, [
+          "--version",
+          item.version,
+          "--no-modify-path",
+        ])
+        expect(result.stderr, item.version).toContain("release metadata")
+        expect((await curlCalls(fixture)).map((args) => args.at(-1)), item.version).toEqual([
+          `https://api.github.com/repos/totalolage/opencode/releases/tags/v${item.version}`,
+        ])
+      } finally {
+        await fs.rm(fixture.root, { recursive: true, force: true })
+      }
+    }
+  })
+
   test("skips an implicit downgrade when the latest release is equal to or older than the target", async () => {
     for (const currentVersion of ["1.2.3", "1.2.4"]) {
       const fixture = await makeFixture()
       try {
-        await writeRelease(fixture, "latest", { tag_name: "v1.2.3", draft: false, prerelease: false })
+        await defaultList(fixture, "1.2.3")
         await writeVersionTarget(fixture, currentVersion)
 
         const previousTarget = await Bun.file(await targetPath(fixture)).text()
@@ -345,7 +417,7 @@ describe("root installer", () => {
         expect(
           (await curlCalls(fixture)).map((args) => args.at(-1)),
           currentVersion,
-        ).toEqual(["https://api.github.com/repos/totalolage/opencode/releases/latest"])
+        ).toEqual(["https://api.github.com/repos/totalolage/opencode/releases?per_page=100&page=1"])
       } finally {
         await fs.rm(fixture.root, { recursive: true, force: true })
       }
@@ -355,7 +427,7 @@ describe("root installer", () => {
   test("compares numeric version components before an implicit upgrade", async () => {
     const fixture = await makeFixture()
     try {
-      await writeRelease(fixture, "latest", { tag_name: "v2.10.0", draft: false, prerelease: false })
+      await defaultList(fixture, "2.10.0")
       await writeVersionTarget(fixture, "2.9.0")
       await makeArchive(fixture, { platform: "linux", arch: "x64", contents: { opencode: "numeric upgrade" } })
 
@@ -369,10 +441,68 @@ describe("root installer", () => {
     }
   })
 
+  test("orders stable above suffix and suffixes by timestamp during implicit upgrades", async () => {
+    const cases = [
+      {
+        name: "upgrades a suffix to a stable release on the same base",
+        latest: "1.18.30",
+        current: "1.18.30-f8y-20260913140000",
+        installs: true,
+      },
+      {
+        name: "upgrades to a suffix with a newer timestamp",
+        latest: "1.18.30-f8y-20260913150000",
+        current: "1.18.30-f8y-20260913140000",
+        installs: true,
+      },
+      {
+        name: "keeps a suffix with a newer timestamp",
+        latest: "1.18.30-f8y-20260913130000",
+        current: "1.18.30-f8y-20260913140000",
+        installs: false,
+      },
+      {
+        name: "keeps a stable release over a suffix on the same base",
+        latest: "1.18.30-f8y-20260913140000",
+        current: "1.18.30",
+        installs: false,
+      },
+    ]
+
+    for (const item of cases) {
+      const fixture = await makeFixture()
+      try {
+        await writeRelease(fixture, "releases-1", [
+          { tag_name: `v${item.latest}`, draft: false, prerelease: suffixOf(item.latest) },
+        ])
+        await writeVersionTarget(fixture, item.current)
+        if (item.installs) {
+          await makeArchive(fixture, { platform: "linux", arch: "x64", contents: { opencode: "upgraded binary" } })
+        }
+
+        const previousTarget = await Bun.file(await targetPath(fixture)).text()
+        const result = await run(["bash", installer, "--no-modify-path"], { env: fixture.env })
+
+        expect(result.code, `${item.name}: ${result.stderr}`).toBe(0)
+        if (item.installs) {
+          expect(await Bun.file(await targetPath(fixture)).text(), item.name).toBe("upgraded binary")
+          expect((await curlCalls(fixture)).map((args) => args.at(-1)), item.name).toHaveLength(3)
+        } else {
+          expect(await Bun.file(await targetPath(fixture)).text(), item.name).toBe(previousTarget)
+          expect((await curlCalls(fixture)).map((args) => args.at(-1)), item.name).toEqual([
+            "https://api.github.com/repos/totalolage/opencode/releases?per_page=100&page=1",
+          ])
+        }
+      } finally {
+        await fs.rm(fixture.root, { recursive: true, force: true })
+      }
+    }
+  })
+
   test("rejects an in-place target modification during archive download", async () => {
     const fixture = await makeFixture()
     try {
-      await writeRelease(fixture, "latest", { tag_name: "v2.0.0", draft: false, prerelease: false })
+      await defaultList(fixture, "2.0.0")
       await writeVersionTarget(fixture, "1.0.0")
       await makeArchive(fixture, { platform: "linux", arch: "x64", contents: { opencode: "downloaded binary" } })
       const target = await targetPath(fixture)
@@ -397,13 +527,13 @@ describe("root installer", () => {
   test("fails an implicit install when the existing target has no strict stable version", async () => {
     const fixture = await makeFixture()
     try {
-      await writeRelease(fixture, "latest", { tag_name: "v1.2.3", draft: false, prerelease: false })
+      await defaultList(fixture, "1.2.3")
       const result = await expectInstallFailurePreservesTarget(fixture, ["--no-modify-path"])
 
       expect(result.stderr).toContain("--version")
       expect(result.stderr).toContain("--binary")
       expect((await curlCalls(fixture)).map((args) => args.at(-1))).toEqual([
-        "https://api.github.com/repos/totalolage/opencode/releases/latest",
+        "https://api.github.com/repos/totalolage/opencode/releases?per_page=100&page=1",
       ])
     } finally {
       await fs.rm(fixture.root, { recursive: true, force: true })
@@ -537,7 +667,7 @@ describe("root installer", () => {
     }
   })
 
-  test("rejects malformed, prerelease, build, and leading-zero versions before network access", async () => {
+  test("rejects malformed, prerelease, build, suffix, and leading-zero versions before network access", async () => {
     const invalidVersions = [
       "1.2",
       "1.2.3.4",
@@ -548,39 +678,139 @@ describe("root installer", () => {
       "vv1.2.3",
       " 1.2.3",
       "1.2.3 ",
+      "9007199254740992.0.0",
+      "1.9007199254740992.0",
+      "1.2.9007199254740992",
+      "1.2.3-f8y-2026091314000",
+      "1.2.3-f8y-202609131400001",
+      "1.2.3-f8y-20230229120000",
+      "1.2.3-f8y-20260931235959",
+      "1.2.3-f8y-00001231000000",
+      "1.2.3-f8y-20261313140000",
+      "1.2.3-f8y-2026091314000a",
+      "1.2.3-f8y-20260913140000-x",
+      "1.2.3-f8y-20260913140000-f8y-20260913140000",
+      "1.2.3-f8x-20260913140000",
+      "1.2.3-f8y-",
+      "1.2.3+f8y-20260913140000",
+      "1.2.3-f8y-20260913140000\n1.2.4",
+      "1.2.3\n",
+      "1.2.3-f8y-2026-0913140000",
     ]
 
     for (const version of invalidVersions) {
       const fixture = await makeFixture()
       try {
         const result = await run(["bash", installer, "--version", version, "--no-modify-path"], { env: fixture.env })
-        expect(result.code, version).not.toBe(0)
-        expect(await curlCalls(fixture), version).toEqual([])
+        expect(result.code, JSON.stringify(version)).not.toBe(0)
+        expect(await curlCalls(fixture), JSON.stringify(version)).toEqual([])
       } finally {
         await fs.rm(fixture.root, { recursive: true, force: true })
       }
     }
   })
 
-  test("rejects incomplete, draft, and prerelease release metadata", async () => {
-    const releases = [
-      { tag_name: "v1.2.3" },
-      { tag_name: "v1.2.3", draft: true, prerelease: false },
-      { tag_name: "v1.2.3", draft: false, prerelease: true },
+  test("fails closed on malformed release list pages", async () => {
+    const releases: unknown[] = [
+      [],
+      ["v1.2.3"],
+      { tag_name: "v1.2.3", draft: false, prerelease: false },
+      [{ tag_name: "v1.2.3", draft: false }],
+      [{ tag_name: "v1.2.3", prerelease: false }],
+      [{ tag_name: "v1.2.3", draft: "false", prerelease: false }],
+      [{ tag_name: "v1.2.3", draft: false, prerelease: "false" }],
     ]
 
     for (const release of releases) {
       const fixture = await makeFixture()
       try {
-        await writeRelease(fixture, "latest", release)
+        await writeRelease(fixture, "releases-1", release)
         const result = await expectInstallFailurePreservesTarget(fixture, ["--no-modify-path"])
-        expect(result.stderr).toContain("release metadata")
+        expect(result.stderr).toContain("release list")
         expect((await curlCalls(fixture)).map((args) => args.at(-1))).toEqual([
-          "https://api.github.com/repos/totalolage/opencode/releases/latest",
+          "https://api.github.com/repos/totalolage/opencode/releases?per_page=100&page=1",
         ])
       } finally {
         await fs.rm(fixture.root, { recursive: true, force: true })
       }
+    }
+  })
+
+  test("skips drafts, unsupported tags, and mismatched flags while discovering the latest release", async () => {
+    const fixture = await makeFixture()
+    try {
+      await writeRelease(fixture, "releases-1", [
+        { tag_name: "v9.9.9", draft: true, prerelease: false },
+        { tag_name: "v9.9.9-f8y-20260913140000", draft: false, prerelease: false },
+        { tag_name: "v8.0.0", draft: false, prerelease: true },
+        { tag_name: "v1.2", draft: false, prerelease: false },
+        { tag_name: "1.2.3", draft: false, prerelease: false },
+        { tag_name: "v1.2.3-beta.1", draft: false, prerelease: true },
+        { tag_name: "v01.2.3", draft: false, prerelease: false },
+      ])
+
+      const result = await expectInstallFailurePreservesTarget(fixture, ["--no-modify-path"])
+      expect(result.stderr).toContain("no supported release")
+      expect((await curlCalls(fixture)).map((args) => args.at(-1))).toEqual([
+        "https://api.github.com/repos/totalolage/opencode/releases?per_page=100&page=1",
+      ])
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  test("discovers the highest supported release across paginated lists", async () => {
+    const fixture = await makeFixture()
+    try {
+      await writeRelease(
+        fixture,
+        "releases-1",
+        Array.from({ length: 100 }, () => stableRelease("1.0.0")),
+      )
+      await writeRelease(fixture, "releases-2", [
+        { tag_name: "v1.2.3", draft: true, prerelease: false },
+        stableRelease("9.9.9"),
+      ])
+
+      await makeArchive(fixture, { platform: "linux", arch: "x64", contents: { opencode: "paginated binary" } })
+      await writeVersionTarget(fixture, "1.0.0")
+
+      const result = await run(["bash", installer, "--no-modify-path"], { env: fixture.env })
+
+      expect(result.code).toBe(0)
+      expect(await Bun.file(await targetPath(fixture)).text()).toBe("paginated binary")
+      expect((await curlCalls(fixture)).map((args) => args.at(-1))).toEqual([
+        "https://api.github.com/repos/totalolage/opencode/releases?per_page=100&page=1",
+        "https://api.github.com/repos/totalolage/opencode/releases?per_page=100&page=2",
+        "https://github.com/totalolage/opencode/releases/download/v9.9.9/opencode-linux-x64.tar.gz",
+        "https://github.com/totalolage/opencode/releases/download/v9.9.9/SHA256SUMS",
+      ])
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true })
+    }
+  })
+
+  test("fails closed when the release list reaches the 100 page bound", async () => {
+    const fixture = await makeFixture()
+    try {
+      for (let page = 1; page <= 100; page++) {
+        await writeRelease(
+          fixture,
+          `releases-${page}`,
+          Array.from({ length: 100 }, () => stableRelease("1.0.0")),
+        )
+      }
+      await seedTarget(fixture, "previous binary")
+
+      const result = await run(["bash", installer, "--no-modify-path"], { env: fixture.env })
+
+      expect(result.code).not.toBe(0)
+      expect(result.stderr).toContain("100 pages")
+      expect(await Bun.file(await targetPath(fixture)).text()).toBe("previous binary")
+      expect(await stagePath(fixture)).toEqual([])
+      expect((await curlCalls(fixture)).map((args) => args.at(-1))).toHaveLength(100)
+    } finally {
+      await fs.rm(fixture.root, { recursive: true, force: true })
     }
   })
 
@@ -725,7 +955,7 @@ printf 'musl libc (x86_64)\n'
     let markerReady = false
     let released = false
     try {
-      await writeRelease(fixture, "latest", { tag_name: "v2.0.0", draft: false, prerelease: false })
+      await defaultList(fixture, "2.0.0")
       await writeVersionTarget(fixture, "1.0.0")
       await makeArchive(fixture, { platform: "linux", arch: "x64", contents: { opencode: "downloaded binary" } })
       const target = await targetPath(fixture)

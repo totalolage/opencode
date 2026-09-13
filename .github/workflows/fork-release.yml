@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Stable release version (X.Y.Z)
+        description: Stable release version (X.Y.Z or X.Y.Z-f8y-<UTC timestamp>)
         required: true
         type: string
       ref:
@@ -193,6 +193,16 @@ jobs:
           name: fork-release-assets
           path: release
 
+      - name: Resolve release metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          if [[ "$RELEASE_VERSION" == *-f8y-* ]]; then
+            printf 'prerelease=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'prerelease=false\n' >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create draft release and upload assets
         run: |
           set -euo pipefail
@@ -218,5 +228,6 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --target "$RELEASE_SHA" \
             --draft \
+            --prerelease="${{ steps.meta.outputs.prerelease }}" \
             --title "$release_tag"
           gh release upload "$release_tag" release/* --repo "$GITHUB_REPOSITORY"

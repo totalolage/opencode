@@ -7,7 +7,6 @@ import { pathToFileURL } from "node:url"
 type ForkModule = typeof import("../../src/installation/fork")
 
 const repositoryPath = "/repos/totalolage/opencode"
-const assetPath = "/totalolage/opencode/releases/download/v1.2.3"
 const version = "1.2.3"
 
 export type ForkFixtureOptions = {
@@ -34,7 +33,7 @@ export type ForkFixture = {
   readonly seedSymlink: () => Promise<void>
   readonly setArchive: (archive: Uint8Array) => void
   readonly setChecksums: (checksums: string) => void
-  readonly setLatest: (release: unknown) => void
+  readonly setReleases: (pages: unknown[]) => void
   readonly setPinned: (release: unknown) => void
   readonly setRedirect: (pathname: string, location: string) => void
   readonly staging: () => Promise<string[]>
@@ -63,11 +62,20 @@ export async function makeForkFixture(options: ForkFixtureOptions = {}): Promise
   const redirects = new Map<string, string>()
   let archive = new Uint8Array(0)
   let checksums = ""
-  let latest: unknown = { tag_name: `v${version}`, draft: false, prerelease: false }
+  let releasePages: unknown[] = [[{ tag_name: `v${version}`, draft: false, prerelease: false }]]
   let pinned: unknown = { tag_name: `v${version}`, draft: false, prerelease: false }
   let archiveBlock: ArchiveBlock | undefined
   let server: ReturnType<typeof Bun.serve> | undefined
   let moduleOwned = false
+
+  // Accepts either a flat list of releases (chunked into pages of 100) or an
+  // explicit array of page bodies; anything else is served verbatim as page 1.
+  const releasePage = (page: number): unknown => {
+    if (!Array.isArray(releasePages)) return page === 1 ? releasePages : []
+    if (releasePages.every((entry) => Array.isArray(entry))) return releasePages[page - 1] ?? []
+    const start = (page - 1) * 100
+    return releasePages.slice(start, start + 100)
+  }
 
   const cleanup = async () => {
     archiveBlock?.release()
@@ -94,14 +102,22 @@ export async function makeForkFixture(options: ForkFixtureOptions = {}): Promise
 
     server = Bun.serve({
       fetch(request) {
-        const pathname = new URL(request.url).pathname
-        requests.push(pathname)
-        const redirect = redirects.get(pathname)
+        const url = new URL(request.url)
+        const key = url.pathname + url.search
+        requests.push(key)
+        const redirect = redirects.get(key)
         if (redirect !== undefined) return new Response(null, { headers: { Location: redirect }, status: 302 })
 
-        if (pathname === `${repositoryPath}/releases/latest`) return json(latest)
-        if (pathname === `${repositoryPath}/releases/tags/v${version}`) return json(pinned)
-        if (pathname === `${assetPath}/${archiveName}`) {
+        if (url.pathname === `${repositoryPath}/releases`) {
+          const page = Number(url.searchParams.get("page") ?? "")
+          if (!Number.isSafeInteger(page) || page < 1) return new Response("invalid page", { status: 400 })
+          return json(releasePage(page))
+        }
+        if (url.pathname.startsWith(`${repositoryPath}/releases/tags/`)) return json(pinned)
+
+        const download = /^\/totalolage\/opencode\/releases\/download\/v[^/]+\/(.+)$/.exec(url.pathname)
+        if (download?.[1] === "SHA256SUMS") return new Response(checksums)
+        if (download?.[1] === archiveName) {
           const block = archiveBlock
           if (block !== undefined) {
             block.signalReady()
@@ -126,7 +142,6 @@ export async function makeForkFixture(options: ForkFixtureOptions = {}): Promise
           }
           return new Response(archive)
         }
-        if (pathname === `${assetPath}/SHA256SUMS`) return new Response(checksums)
         return new Response("not found", { status: 404 })
       },
       hostname: "127.0.0.1",
@@ -177,8 +192,8 @@ export async function makeForkFixture(options: ForkFixtureOptions = {}): Promise
       setChecksums(next) {
         checksums = next
       },
-      setLatest(next) {
-        latest = next
+      setReleases(next) {
+        releasePages = next
       },
       setPinned(next) {
         pinned = next
@@ -275,7 +290,7 @@ async function compileFork(
       ...(options.arch === undefined ? {} : { "process.arch": JSON.stringify(options.arch) }),
       ...(options.libc === undefined ? {} : { OPENCODE_LIBC: JSON.stringify(options.libc) }),
     },
-    external: ["effect", "semver", "@zip.js/zip.js", "@opencode-ai/core"],
+    external: ["effect", "semver", "@zip.js/zip.js", "@opencode-ai/core", "@opencode-ai/script"],
     format: "esm",
     outdir: root,
     target: "bun",

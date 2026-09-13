@@ -92,7 +92,7 @@ describe("installation", () => {
       (request) => {
         forkUrls.push(request.url)
         return Fork.IS_FORK
-          ? jsonResponse({ tag_name: "v2.0.0", draft: false, prerelease: false })
+          ? jsonResponse([{ tag_name: "v2.0.0", draft: false, prerelease: false }])
           : jsonResponse({ version: "2.0.0" })
       },
       (cmd, args) => {
@@ -105,7 +105,9 @@ describe("installation", () => {
       const result = yield* Installation.use.latest("npm")
       expect(result).toBe("2.0.0")
       if (!Fork.IS_FORK) return
-      expect(forkUrls).toEqual(["https://api.github.com/repos/totalolage/opencode/releases/latest"])
+      expect(forkUrls).toEqual([
+        "https://api.github.com/repos/totalolage/opencode/releases?per_page=100&page=1",
+      ])
       expect(forkProbes).toEqual([])
     }),
   )
