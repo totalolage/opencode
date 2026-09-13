@@ -51,6 +51,7 @@ type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  deferFinalization?: boolean
 }
 
 export interface Interface {
@@ -597,7 +598,7 @@ const layer = Layer.effect(
           yield* session.updatePart({
             ...part,
             state: {
-              ...part.state,
+              input: part.state.input,
               status: "error",
               error: "Tool execution aborted",
               metadata: { ...metadata, interrupted: true },
@@ -607,7 +608,7 @@ const layer = Layer.effect(
         }
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
-        yield* session.updateMessage(ctx.assistantMessage)
+        if (!input.deferFinalization) yield* session.updateMessage(ctx.assistantMessage)
       })
 
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
