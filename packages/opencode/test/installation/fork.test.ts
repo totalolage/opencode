@@ -28,10 +28,15 @@ const fixture = (options?: Parameters<typeof makeForkFixture>[0]) =>
 
 describe("installation fork", () => {
   test("accepts a strict stable version", () => {
-    expect(Fork.stableVersion("v1.2.3")).toBe("1.2.3")
+    expect(Fork.supportedVersion("v1.2.3")).toBe("1.2.3")
   })
 
-  test("rejects prereleases, builds, leading zeroes, and unsafe versions", () => {
+  test("accepts fork timestamped releases with an optional v prefix", () => {
+    expect(Fork.supportedVersion("1.18.30-f8y-20260913140000")).toBe("1.18.30-f8y-20260913140000")
+    expect(Fork.supportedVersion("v1.18.30-f8y-20260913140000")).toBe("1.18.30-f8y-20260913140000")
+  })
+
+  test("rejects prereleases, builds, leading zeroes, unsafe versions, and bad timestamps", () => {
     for (const input of [
       "1.2",
       "1.2.3.4",
@@ -41,9 +46,19 @@ describe("installation fork", () => {
       "1.2.3+build",
       "V1.2.3",
       "9007199254740992.0.0",
+      "1.2.3-f8y-202609131400",
+      "1.2.3-f8y-20261331000000",
     ]) {
-      expect(Fork.stableVersion(input), input).toBeUndefined()
+      expect(Fork.supportedVersion(input), input).toBeUndefined()
     }
+  })
+
+  test("orders stable over same-core timestamps, higher cores first, timestamps lexicographically", () => {
+    expect(Fork.compareVersions("1.2.3", "1.2.3-f8y-20991231000000")).toBe(1)
+    expect(Fork.compareVersions("1.3.0-f8y-20200101000000", "1.2.9")).toBe(1)
+    expect(Fork.compareVersions("1.2.3-f8y-20260913140000", "1.2.3-f8y-20250101000000")).toBe(1)
+    expect(Fork.compareVersions("2.0.0", "1.999.999-f8y-20991231000000")).toBe(1)
+    expect(Fork.compareVersions("1.2.3-f8y-20260913140000", "1.2.3-f8y-20260913140000")).toBe(0)
   })
 
   test("identifies only direct .opencode/bin and .local/bin binaries", () => {
@@ -69,7 +84,129 @@ describe("installation fork", () => {
     Effect.gen(function* () {
       const value = yield* fixture()
       expect(yield* value.compiled.latest()).toBe("1.2.3")
-      expect(value.requests).toEqual(["/repos/totalolage/opencode/releases/latest"])
+      expect(value.requests).toEqual(["/repos/totalolage/opencode/releases?per_page=100&page=1"])
+    }),
+  )
+
+  integration("selects the highest eligible release from an unordered mixed list", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      value.setReleases([
+        { tag_name: "v2.0.0", draft: true, prerelease: false },
+        { tag_name: "1.9.0", draft: false, prerelease: false },
+        { tag_name: "v1.9.0", draft: false, prerelease: true },
+        { tag_name: "v2.0.0", draft: false, prerelease: true },
+        { tag_name: "v1.8.0-f8y-20260913140000", draft: false, prerelease: true },
+        { tag_name: "v1.9.5", draft: false, prerelease: false },
+      ])
+      expect(yield* value.compiled.latest()).toBe("1.9.5")
+      expect(value.requests).toEqual(["/repos/totalolage/opencode/releases?per_page=100&page=1"])
+    }),
+  )
+
+  integration("prefers a stable release over a timestamped one on the same core", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      value.setReleases([
+        { tag_name: "v1.2.3-f8y-20991231000000", draft: false, prerelease: true },
+        { tag_name: "v1.2.3", draft: false, prerelease: false },
+      ])
+      expect(yield* value.compiled.latest()).toBe("1.2.3")
+    }),
+  )
+
+  integration("prefers a higher timestamped core over a lower stable one", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      value.setReleases([
+        { tag_name: "v1.2.3", draft: false, prerelease: false },
+        { tag_name: "v1.3.0-f8y-20200101000000", draft: false, prerelease: true },
+      ])
+      expect(yield* value.compiled.latest()).toBe("1.3.0-f8y-20200101000000")
+    }),
+  )
+
+  integration("prefers the newer timestamp on the same core", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      value.setReleases([
+        { tag_name: "v1.2.3-f8y-20250101000000", draft: false, prerelease: true },
+        { tag_name: "v1.2.3-f8y-20260913140000", draft: false, prerelease: true },
+      ])
+      expect(yield* value.compiled.latest()).toBe("1.2.3-f8y-20260913140000")
+    }),
+  )
+
+  integration("reads the second page when the first page is full", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      const firstPage = Array.from({ length: 100 }, (_, index) => ({
+        tag_name: `v1.0.${index}`,
+        draft: false,
+        prerelease: false,
+      }))
+      value.setReleases([firstPage, [{ tag_name: "v3.0.0", draft: false, prerelease: false }]])
+      expect(yield* value.compiled.latest()).toBe("3.0.0")
+      expect(value.requests).toEqual([
+        "/repos/totalolage/opencode/releases?per_page=100&page=1",
+        "/repos/totalolage/opencode/releases?per_page=100&page=2",
+      ])
+    }),
+  )
+
+  integration("fails closed after 100 full pages without requesting page 101", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      value.setReleases(
+        Array.from({ length: 100 * 100 }, () => ({ tag_name: "v1.0.0", draft: false, prerelease: false })),
+      )
+
+      const error = yield* value.compiled.latest().pipe(Effect.flip)
+      expect(error).toBeInstanceOf(value.compiled.ForkUpdateError)
+      expect(error.message).toContain("exceeded 100 pages")
+      expect(value.requests).toHaveLength(100)
+      expect(value.requests[0]).toBe("/repos/totalolage/opencode/releases?per_page=100&page=1")
+      expect(value.requests[99]).toBe("/repos/totalolage/opencode/releases?per_page=100&page=100")
+      expect(value.requests.some((request) => request.includes("page=101"))).toBe(false)
+    }),
+  )
+
+  integration("selects the accumulated highest when page 100 is short", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      const release = (tag: string) => ({ tag_name: tag, draft: false, prerelease: false })
+      const firstPage = [release("v9.9.9"), ...Array.from({ length: 99 }, (_, index) => release(`v1.0.${index}`))]
+      const fullPages = Array.from({ length: 98 }, (_, page) =>
+        Array.from({ length: 100 }, (_, index) => release(`v2.0.${page * 100 + index}`)),
+      )
+      value.setReleases([firstPage, ...fullPages, [release("v1.0.999")]])
+
+      expect(yield* value.compiled.latest()).toBe("9.9.9")
+      expect(value.requests).toHaveLength(100)
+      expect(value.requests[99]).toBe("/repos/totalolage/opencode/releases?per_page=100&page=100")
+      expect(value.requests.some((request) => request.includes("page=101"))).toBe(false)
+    }),
+  )
+
+  integration("fails closed when no eligible release exists", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      value.setReleases([])
+      const error = yield* value.compiled.latest().pipe(Effect.flip)
+      expect(error).toBeInstanceOf(value.compiled.ForkUpdateError)
+      expect(error.message).toContain("No eligible fork release")
+      expect(value.requests).toEqual(["/repos/totalolage/opencode/releases?per_page=100&page=1"])
+    }),
+  )
+
+  integration("fails closed on malformed release listing metadata", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      for (const pages of ["nope", [{ tag_name: "v1.2.3" }], [{ tag_name: 42, draft: false, prerelease: false }]]) {
+        value.setReleases(pages as unknown[])
+        const error = yield* value.compiled.latest().pipe(Effect.flip)
+        expect(error).toBeInstanceOf(value.compiled.ForkUpdateError)
+      }
     }),
   )
 
@@ -78,12 +215,13 @@ describe("installation fork", () => {
       const value = yield* fixture({ compileOrigin: "http://127.0.0.1:80" })
       const existingHttpClient = yield* HttpClient.HttpClient
       const client = HttpClient.mapRequest(existingHttpClient, (request) => {
-        expect(request.url).toBe("http://127.0.0.1:80/repos/totalolage/opencode/releases/latest")
-        return HttpClientRequest.setUrl(request, `${value.origin}${new URL(request.url).pathname}`)
+        expect(request.url).toBe("http://127.0.0.1:80/repos/totalolage/opencode/releases?per_page=100&page=1")
+        const url = new URL(request.url)
+        return HttpClientRequest.setUrl(request, `${value.origin}${url.pathname}${url.search}`)
       })
 
       expect(yield* value.compiled.latest().pipe(Effect.provideService(HttpClient.HttpClient, client))).toBe("1.2.3")
-      expect(value.requests).toEqual(["/repos/totalolage/opencode/releases/latest"])
+      expect(value.requests).toEqual(["/repos/totalolage/opencode/releases?per_page=100&page=1"])
     }),
   )
 
@@ -106,19 +244,50 @@ describe("installation fork", () => {
     }),
   )
 
-  integration("rejects invalid latest release metadata", () =>
+  integration("rejects a pinned prerelease flag mismatch before download", () =>
     Effect.gen(function* () {
       const value = yield* fixture()
-      for (const release of [
-        { tag_name: "v1.2.3" },
-        { tag_name: "v1.2.3", draft: true, prerelease: false },
-        { tag_name: "v1.2.3", draft: false, prerelease: true },
-        { tag_name: "1.2.3", draft: false, prerelease: false },
-      ]) {
-        value.setLatest(release)
-        const error = yield* value.compiled.latest().pipe(Effect.flip)
-        expect(error).toBeInstanceOf(value.compiled.ForkUpdateError)
-      }
+      yield* Effect.promise(() => value.seed("old binary"))
+      value.setPinned({ tag_name: "v1.2.3", draft: false, prerelease: true })
+      const stable = yield* value.compiled.upgrade("v1.2.3", value.target).pipe(Effect.flip)
+      expect(stable.message).toContain("prerelease flag")
+      expect(new TextDecoder().decode(yield* Effect.promise(value.readTarget))).toBe("old binary")
+
+      const timestamped = "1.18.30-f8y-20260913140000"
+      value.setPinned({ tag_name: `v${timestamped}`, draft: false, prerelease: false })
+      const mismatched = yield* value.compiled.upgrade(timestamped, value.target).pipe(Effect.flip)
+      expect(mismatched.message).toContain("prerelease flag")
+      expect(new TextDecoder().decode(yield* Effect.promise(value.readTarget))).toBe("old binary")
+    }),
+  )
+
+  integration("installs a fork timestamped release", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      const version = "1.18.30-f8y-20260913140000"
+      value.setPinned({ tag_name: `v${version}`, draft: false, prerelease: true })
+      yield* Effect.promise(() => value.seed("old binary"))
+      yield* value.compiled.upgrade(version, value.target)
+
+      expect(new TextDecoder().decode(yield* Effect.promise(value.readTarget))).toBe("new binary")
+      expect(yield* Effect.promise(value.staging)).toEqual([])
+      expect(value.requests).toEqual([
+        `/repos/totalolage/opencode/releases/tags/v${version}`,
+        `/totalolage/opencode/releases/download/v${version}/${value.archiveName}`,
+        `/totalolage/opencode/releases/download/v${version}/SHA256SUMS`,
+      ])
+    }),
+  )
+
+  integration("rejects a pinned draft", () =>
+    Effect.gen(function* () {
+      const value = yield* fixture()
+      yield* Effect.promise(() => value.seed("old binary"))
+      value.setPinned({ tag_name: "v1.2.3", draft: true, prerelease: false })
+      const error = yield* value.compiled.upgrade("1.2.3", value.target).pipe(Effect.flip)
+      expect(error.message).toContain("is a draft")
+      expect(new TextDecoder().decode(yield* Effect.promise(value.readTarget))).toBe("old binary")
+      expect(value.requests).toEqual(["/repos/totalolage/opencode/releases/tags/v1.2.3"])
     }),
   )
 
@@ -444,23 +613,26 @@ describe("installation fork", () => {
   integration("rejects an insecure redirect before following it", () =>
     Effect.gen(function* () {
       const value = yield* fixture()
-      value.setRedirect("/repos/totalolage/opencode/releases/latest", "https://evil.invalid/releases/latest")
+      value.setRedirect("/repos/totalolage/opencode/releases?per_page=100&page=1", "https://evil.invalid/releases")
 
       const error = yield* value.compiled.latest().pipe(Effect.flip)
       expect(error.message).toContain("Rejected insecure or untrusted update URL")
-      expect(value.requests).toEqual(["/repos/totalolage/opencode/releases/latest"])
+      expect(value.requests).toEqual(["/repos/totalolage/opencode/releases?per_page=100&page=1"])
     }),
   )
 
   integration("returns a typed HTTP 404 for an unavailable latest release", () =>
     Effect.gen(function* () {
       const value = yield* fixture()
-      value.setRedirect("/repos/totalolage/opencode/releases/latest", `${value.origin}/missing-release`)
+      value.setRedirect("/repos/totalolage/opencode/releases?per_page=100&page=1", `${value.origin}/missing-release`)
 
       const error = yield* value.compiled.latest().pipe(Effect.flip)
       expect(error).toBeInstanceOf(value.compiled.ForkUpdateError)
       expect(error.message).toContain("HTTP 404")
-      expect(value.requests).toEqual(["/repos/totalolage/opencode/releases/latest", "/missing-release"])
+      expect(value.requests).toEqual([
+        "/repos/totalolage/opencode/releases?per_page=100&page=1",
+        "/missing-release",
+      ])
     }),
   )
 

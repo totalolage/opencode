@@ -6,9 +6,10 @@ import { chmod, copyFile, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/pr
 import os from "node:os"
 import path from "node:path"
 import { Readable } from "node:stream"
+import { ForkVersion } from "@opencode-ai/script/version"
 
-const OLD_VERSION = "0.0.1"
-const NEW_VERSION = "0.0.2"
+const OLD_VERSION = "1.18.30-f8y-20260913130000"
+const NEW_VERSION = "1.18.30-f8y-20260913140000"
 const BUILD_TIMEOUT_MS = 10 * 60 * 1000
 const COMMAND_TIMEOUT_MS = 60 * 1000
 const VERSION_TIMEOUT_MS = 20 * 1000
@@ -20,7 +21,7 @@ const CHECKSUM_MISMATCH_DIAGNOSTIC = /Checksum mismatch for .*expected [0-9a-f]{
 const TRUNCATED_DOWNLOAD_DIAGNOSTIC =
   /(Checksum mismatch for .*expected [0-9a-f]{64}, received [0-9a-f]{64}|content[- ]length|truncat|incomplete|premature|unexpected end|body.*(short|size))/i
 const MISSING_RELEASE_DIAGNOSTIC = /(HTTP 404|release.*not found|request failed with HTTP 404)/i
-const INVALID_RELEASE_DIAGNOSTIC = /Invalid release tag: not-a-version/i
+const INVALID_RELEASE_DIAGNOSTIC = /No eligible fork release found/i
 const PERMISSION_DIAGNOSTIC =
   /(EACCES|EPERM|permission denied|permissiondenied|not writable|read-only|operation not permitted)/i
 
@@ -538,7 +539,10 @@ async function runtimeEnvironment(root: string, shims: { directory: string; log:
 
 function makeReleasePaths(archiveName: string, checksumName: string): ReleasePaths {
   return {
-    latest: "/repos/totalolage/opencode/releases/latest",
+    // The updater discovers the latest release through the paginated list
+    // endpoint; the fixture pins the exact expected query so wrong discovery
+    // shows up as an unknown fixture route.
+    latest: `/repos/totalolage/opencode/releases?per_page=100&page=1`,
     tag: `/repos/totalolage/opencode/releases/tags/v${NEW_VERSION}`,
     archive: `/totalolage/opencode/releases/download/v${NEW_VERSION}/${archiveName}`,
     checksums: `/totalolage/opencode/releases/download/v${NEW_VERSION}/${checksumName}`,
@@ -605,7 +609,9 @@ function releaseMetadata(fixture: Fixture) {
     target_commitish: "dev",
     name: `v${NEW_VERSION}`,
     draft: false,
-    prerelease: false,
+    // Timestamped fork releases are published as prereleases; the updater
+    // requires prerelease === isTimestamped(version) for eligibility.
+    prerelease: true,
     created_at: "2026-01-01T00:00:00Z",
     published_at: "2026-01-01T00:00:00Z",
     tarball_url: `${fixture.origin}/totalolage/opencode/archive/refs/tags/v${NEW_VERSION}.tar.gz`,
@@ -674,16 +680,16 @@ function recordRequest(fixture: Fixture, request: Request, url: URL, status: num
 function serveFixture(request: Request, fixture: Fixture) {
   const url = new URL(request.url)
   const knownPath = [fixture.paths.latest, fixture.paths.tag, fixture.paths.archive, fixture.paths.checksums].includes(
-    url.pathname,
+    `${url.pathname}${url.search}`,
   )
-  const known = request.method === "GET" && url.origin === fixture.origin && url.search === "" && knownPath
+  const known = request.method === "GET" && url.origin === fixture.origin && knownPath
 
   if (!known) {
     recordRequest(fixture, request, url, 404, false)
     return textResponse(`unknown fixture route: ${request.method} ${url.pathname}${url.search}\n`, 404)
   }
 
-  if (url.pathname === fixture.paths.latest || url.pathname === fixture.paths.tag) {
+  if (`${url.pathname}${url.search}` === fixture.paths.latest || url.pathname === fixture.paths.tag) {
     if (fixture.mode === "missing-release") {
       recordRequest(fixture, request, url, 404, true)
       return textResponse("release not found\n", 404)
@@ -693,7 +699,10 @@ function serveFixture(request: Request, fixture: Fixture) {
       return textResponse("release fixture is not ready\n", 503)
     }
     recordRequest(fixture, request, url, 200, true)
-    return jsonResponse(releaseMetadata(fixture))
+    if (url.pathname === fixture.paths.tag) return jsonResponse(releaseMetadata(fixture))
+    // The list endpoint returns a single-entry page; a page smaller than the
+    // updater's page size ends pagination after this request.
+    return jsonResponse([releaseMetadata(fixture)])
   }
 
   if (fixture.mode === "missing-release" || !fixture.release) {
@@ -1214,8 +1223,8 @@ async function main() {
     if (typeof process.getuid === "function" && process.getuid() === 0) {
       throw new Error("fork upgrade verification must run as a non-root user so permission scenarios are meaningful")
     }
-    if (!/^\d+\.\d+\.\d+$/.test(OLD_VERSION) || !/^\d+\.\d+\.\d+$/.test(NEW_VERSION)) {
-      throw new Error("verification versions must be strict stable versions")
+    if (ForkVersion.parse(OLD_VERSION) !== OLD_VERSION || ForkVersion.parse(NEW_VERSION) !== NEW_VERSION) {
+      throw new Error("verification versions must be supported fork release versions")
     }
 
     removeSignalHandlers = installSignalHandlers()

@@ -2,6 +2,7 @@
 
 import { mkdir, rm, stat } from "node:fs/promises"
 import path from "node:path"
+import { parse } from "../../packages/script/src/version"
 
 const repoRoot = path.resolve(import.meta.dir, "../..")
 
@@ -50,10 +51,12 @@ export type PackageReleaseOptions = {
   outputDirectory: string
 }
 
-const stableVersion = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/
-
 export function validateVersion(version: string) {
-  if (!stableVersion.test(version)) throw new Error("version must be a stable X.Y.Z version")
+  // parse() accepts a single leading "v" by normalizing it away, so the strict
+  // round-trip here rejects it: release and build inputs have no prefix.
+  if (parse(version) !== version) {
+    throw new Error("version must be a stable X.Y.Z or X.Y.Z-f8y-<UTC timestamp> version")
+  }
   return version
 }
 

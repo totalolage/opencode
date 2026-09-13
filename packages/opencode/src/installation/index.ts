@@ -52,9 +52,11 @@ export function getReleaseType(current: string, latest: string): ReleaseType {
 export function decideUpdate(input: UpdatePolicyInput): UpdateDecision {
   if (input.autoupdate === false) return "noop"
 
-  const current = Fork.IS_FORK ? Fork.stableVersion(input.current) : semver.valid(input.current)
-  const latest = Fork.IS_FORK ? Fork.stableVersion(input.latest) : semver.valid(input.latest)
-  if (!current || !latest || !semver.gt(latest, current)) return "noop"
+  const current = Fork.IS_FORK ? Fork.supportedVersion(input.current) : semver.valid(input.current)
+  const latest = Fork.IS_FORK ? Fork.supportedVersion(input.latest) : semver.valid(input.latest)
+  if (!current || !latest) return "noop"
+  const newer = Fork.IS_FORK ? Fork.compareVersions(latest, current) > 0 : semver.gt(latest, current)
+  if (!newer) return "noop"
 
   if (input.alwaysNotify || input.autoupdate === "notify") return "notify"
 
@@ -70,18 +72,18 @@ export function decideManualUpgrade(input: {
   latest?: string
 }): ManualUpgradeDecision {
   if (input.requested !== undefined) {
-    const target = Fork.stableVersion(input.requested)
+    const target = Fork.supportedVersion(input.requested)
     if (!target) return { type: "instructions" }
     return { type: "upgrade", target }
   }
 
-  const current = Fork.stableVersion(input.current)
+  const current = Fork.supportedVersion(input.current)
   if (!current) return { type: "instructions" }
   if (input.latest === undefined) return { type: "lookup" }
 
-  const latest = Fork.stableVersion(input.latest)
+  const latest = Fork.supportedVersion(input.latest)
   if (!latest) return { type: "instructions" }
-  if (!semver.gt(latest, current)) return { type: "skip" }
+  if (Fork.compareVersions(latest, current) <= 0) return { type: "skip" }
   return { type: "upgrade", target: latest }
 }
 

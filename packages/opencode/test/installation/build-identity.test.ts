@@ -217,6 +217,41 @@ describe("build identity", () => {
     })
   }
 
+  test("accepts a suffix fork release identity", async () => {
+    const script = successful(
+      await runScript({
+        OPENCODE_CHANNEL: "latest",
+        OPENCODE_FORK_RELEASE: "1",
+        OPENCODE_VERSION: "1.18.30-f8y-20260913140000",
+      }),
+    )
+
+    expect(script).toMatchObject({
+      channel: "latest",
+      forkRelease: true,
+      upstream: false,
+      version: "1.18.30-f8y-20260913140000",
+    })
+  })
+
+  for (const version of [
+    "v1.18.30-f8y-20260913140000",
+    "1.18.30-f8y-20230229120000",
+    "1.18.30-f8y-202402291200",
+    "1.18.30-f8y-20261313140000",
+  ]) {
+    test(`rejects invalid suffix fork release version ${version}`, async () => {
+      await expectFailure(
+        {
+          OPENCODE_CHANNEL: "latest",
+          OPENCODE_FORK_RELEASE: "1",
+          OPENCODE_VERSION: version,
+        },
+        "explicit stable X.Y.Z",
+      )
+    })
+  }
+
   test("exposes the fork update test origin for build wiring", async () => {
     const script = successful(
       await runScript({

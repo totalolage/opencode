@@ -1,6 +1,7 @@
 import { $ } from "bun"
 import semver from "semver"
 import path from "path"
+import { parse } from "./version"
 
 const rootPkgPath = path.resolve(import.meta.dir, "../../../package.json")
 const rootPkg = await Bun.file(rootPkgPath).json()
@@ -34,8 +35,10 @@ if (IS_UPSTREAM_BUILD && IS_FORK_RELEASE) {
 }
 
 if (IS_FORK_RELEASE) {
-  if (!env.OPENCODE_VERSION || !isStrictStableVersion(env.OPENCODE_VERSION)) {
-    throw new Error("OPENCODE_VERSION must be an explicit stable X.Y.Z version for OPENCODE_FORK_RELEASE=1")
+  if (!env.OPENCODE_VERSION || parse(env.OPENCODE_VERSION) !== env.OPENCODE_VERSION) {
+    throw new Error(
+      "OPENCODE_VERSION must be an explicit stable X.Y.Z or X.Y.Z-f8y-<timestamp> version for OPENCODE_FORK_RELEASE=1",
+    )
   }
   if (env.OPENCODE_CHANNEL !== "latest") {
     throw new Error("OPENCODE_CHANNEL=latest is required for OPENCODE_FORK_RELEASE=1")
@@ -109,7 +112,3 @@ export const Script = {
   },
 }
 console.log(`opencode script`, JSON.stringify(Script, null, 2))
-
-function isStrictStableVersion(value: string) {
-  return /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(value) && semver.valid(value) === value
-}

@@ -23,6 +23,26 @@ Set `OPENCODE_UPSTREAM_BUILD=1` only when a maintainer needs to preserve the ups
 
 For a stable fork release, set an explicit `OPENCODE_VERSION=X.Y.Z` without the `v` prefix and `OPENCODE_CHANNEL=latest` with `OPENCODE_FORK_RELEASE=1`. The release tag adds the `v` prefix, so the tag is `vX.Y.Z`. A non-`latest` channel is a preview build and is outside the stable update policy.
 
+The build identity also accepts fork timestamp versions in the exact form `X.Y.Z-f8y-YYYYMMDDHHmmss`. The suffix must be a real UTC Gregorian date and time. Issue it with:
+
+```sh
+OPENCODE_VERSION="1.18.30-f8y-$(date -u +%Y%m%d%H%M%S)"
+```
+
+Version inputs are validated strictly: build and workflow inputs must already be normalized, so a leading `v` is rejected there even though the shared parser accepts and strips one.
+
+## Timestamp releases
+
+A timestamp release shares its base version with a stable release, for example `1.18.30-f8y-20260913140000` shares the base `1.18.30`. Ordering rules:
+
+- For the same base, a stable `X.Y.Z` always outranks its `X.Y.Z-f8y-...` suffix versions.
+- Two timestamp versions with the same base compare by their UTC timestamps, so a later issuance wins.
+- Across bases, normal semver precedence applies, so `1.18.31-f8y-...` outranks `1.18.30` and all `1.18.30-f8y-...` versions.
+
+The GitHub release for a timestamp version is published with `prerelease=true`; a plain stable release is published with `prerelease=false`. Release discovery supports both forms and selects the highest supported version, whether that highest version is a stable release or a timestamp release.
+
+Timestamp builds are issued so an unpublished local artifact can be tested against a specific build identity. Published release discovery and the updater treat a published timestamp release like any other published version: the updater installs it under the normal update rules and still prefers a newer stable release of the same base. Testing a build before it is published requires the `--fork-update-test` fixture mode described below; the updater only ever offers published versions.
+
 ## Release workflow
 
 The fork release workflow is `.github/workflows/fork-release.yml`. A manual run accepts `version` and `ref` inputs. The `publish` input defaults to `false`.

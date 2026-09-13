@@ -120,6 +120,59 @@ describe("fork upgrade method policy", () => {
   })
 })
 
+describe("fork timestamped update policy", () => {
+  if (!Fork.IS_FORK) return
+
+  const oldTimestamp = "1.18.30-f8y-20260913140000"
+  const newTimestamp = "1.18.30-f8y-20260913200000"
+
+  test("accepts a concrete fork timestamped release", () => {
+    expect(Fork.supportedVersion(oldTimestamp)).toBe(oldTimestamp)
+    expect(Installation.decideManualUpgrade({ current: "1.18.29", requested: oldTimestamp })).toEqual({
+      type: "upgrade",
+      target: oldTimestamp,
+    })
+  })
+
+  test("installs a newer timestamp and ignores an older one", () => {
+    expect(decide({ current: oldTimestamp, latest: newTimestamp, method: "curl" })).toBe("install")
+    expect(decide({ current: newTimestamp, latest: oldTimestamp, method: "curl" })).toBe("noop")
+  })
+
+  test("allows a suffix to upgrade to the same-base stable release", () => {
+    expect(decide({ current: oldTimestamp, latest: "1.18.30", method: "curl" })).toBe("install")
+  })
+
+  test("does not auto-downgrade a stable release to a same-base suffix", () => {
+    expect(decide({ current: "1.18.30", latest: oldTimestamp, method: "curl" })).toBe("noop")
+    expect(Installation.decideManualUpgrade({ current: "1.18.30", latest: oldTimestamp })).toEqual({
+      type: "skip",
+    })
+  })
+
+  test("installs a higher-core suffix over a lower stable release", () => {
+    expect(decide({ current: "1.18.29", latest: newTimestamp, method: "curl" })).toBe("install")
+  })
+
+  test("rejects an unsafe current version", () => {
+    expect(decide({ current: "1.18.30-f8y-notatime", latest: "1.18.31", method: "curl" })).toBe("noop")
+  })
+
+  test("treats implicit suffix comparison in manual upgrades consistently", () => {
+    expect(Installation.decideManualUpgrade({ current: oldTimestamp, latest: newTimestamp })).toEqual({
+      type: "upgrade",
+      target: newTimestamp,
+    })
+    expect(Installation.decideManualUpgrade({ current: oldTimestamp, latest: "1.18.30" })).toEqual({
+      type: "upgrade",
+      target: "1.18.30",
+    })
+    expect(Installation.decideManualUpgrade({ current: oldTimestamp, latest: "1.18.29" })).toEqual({
+      type: "skip",
+    })
+  })
+})
+
 async function runUpstreamUpgradePolicyTests() {
   await using tmp = await tmpdir()
   const environment = Object.fromEntries(
