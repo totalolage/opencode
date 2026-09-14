@@ -275,6 +275,34 @@ function projection(db: DB) {
 
 type Projection = Effect.Success<ReturnType<typeof projection>>
 
+// Summary frozen into the delegation envelope content, matching what a canonical
+// return carries once SessionSummary has written diffs back through the projector.
+const originalSummary = {
+  title: "original title",
+  body: "original body",
+  diffs: [{ file: "a.txt", patch: "--- a/a.txt\n+++ b/a.txt\n", additions: 1, deletions: 0, status: "modified" as const }],
+}
+
+function summaryContent(resolution: Delegation.Resolution, agent: string, infoModel: ModelRef) {
+  const base = multipartContent(resolution, agent, infoModel)
+  return { ...base, message: { ...base.message, summary: originalSummary } }
+}
+
+function persistSummaryProjection(
+  db: DB,
+  core: DelegationStore.Interface,
+  resolution: Delegation.Resolution,
+  agent: string,
+  infoModel: ModelRef,
+) {
+  return Effect.gen(function* () {
+    const content = summaryContent(resolution, agent, infoModel)
+    const prepared = yield* prepare(core, resolution, content)
+    expect(yield* receiveStandalone(db, prepared)).toEqual({ status: "admitted" })
+    return { content, prepared }
+  })
+}
+
 function persistPreparedProjection(
   db: DB,
   core: DelegationStore.Interface,
@@ -1339,5 +1367,432 @@ it.effect("appends eligible canonical returns after compacted history in Core in
     expect(resolutionState(admittedAfter)).toEqual(resolutionState(admittedBefore))
     expect(resolutionState(consumedAfter)).toEqual(resolutionState(consumedBefore))
     expect(resolutionState(pendingAfter)).toEqual(resolutionState(pendingBefore))
+  }),
+)
+
+function applyMessageSummary(db: DB, messageID: string, summary: unknown) {
+  return Effect.gen(function* () {
+    const row = yield* db.select().from(MessageTable).where(eq(MessageTable.id, storedMessageID(messageID))).get()
+    if (row === undefined) return yield* Effect.die(`expected persisted message ${messageID}`)
+    yield* db
+      .update(MessageTable)
+      .set({ data: { ...row.data, summary } as typeof row.data })
+      .where(eq(MessageTable.id, row.id))
+      .run()
+      .pipe(Effect.orDie)
+  })
+}
+
+it.effect("loads canonical returns whose persisted user summary replaced only diffs", () =>
+  Effect.gen(function* () {
+    const parentID = sessionID("summary-diffs-parent")
+    const admittedChildID = sessionID("summary-diffs-admitted-child")
+    const consumedChildID = sessionID("summary-diffs-consumed-child")
+    const { db, core, delegation } = yield* setup(
+      { id: parentID },
+      { id: admittedChildID, parentID },
+      { id: consumedChildID, parentID },
+    )
+    const admitted = yield* registerResolution(core, "summary-diffs-admitted", parentID, admittedChildID)
+    const consumed = yield* registerResolution(core, "summary-diffs-consumed", parentID, consumedChildID)
+    const admittedFixture = yield* persistSummaryProjection(
+      db,
+      core,
+      admitted.resolution,
+      "summary-diffs-admitted-agent",
+      model("summary-diffs-admitted-provider", "summary-diffs-admitted-model", "summary-diffs-admitted-variant"),
+    )
+    yield* core.admit(admittedFixture.prepared.id, SessionDelegation.receive)
+    const consumedFixture = yield* persistSummaryProjection(
+      db,
+      core,
+      consumed.resolution,
+      "summary-diffs-consumed-agent",
+      model("summary-diffs-consumed-provider", "summary-diffs-consumed-model", "summary-diffs-consumed-variant"),
+    )
+    yield* core.admit(consumedFixture.prepared.id, SessionDelegation.receive)
+    yield* core.markConsumed({ parentID, ids: [consumed.resolution.id] })
+    const beforeAdmitted = yield* core.getResolution(admitted.resolution.id)
+    const beforeConsumed = yield* core.getResolution(consumed.resolution.id)
+    if (beforeAdmitted === undefined || beforeConsumed === undefined) {
+      return yield* Effect.die("expected resolutions before history")
+    }
+
+    const loadExpectations = (admittedDiffs: readonly unknown[], consumedDiffs: readonly unknown[]) =>
+      Effect.gen(function* () {
+        const updated = yield* projection(db)
+        const result = yield* delegation.history(parentID, [])
+        expect(result.incoming.map((resolution) => resolution.id)).toEqual([
+          admitted.resolution.id,
+          consumed.resolution.id,
+        ])
+        expect(result.messages.map((message) => message.info.id)).toEqual(
+          [admitted.resolution, consumed.resolution].map((resolution) => storedMessageID(resolution.messageID)),
+        )
+
+        for (const [resolution, item, expectedDiffs] of [
+          [admitted.resolution, admittedFixture, admittedDiffs],
+          [consumed.resolution, consumedFixture, consumedDiffs],
+        ] as const) {
+          const row = updated.messages.find((message) => message.id === storedMessageID(resolution.messageID))
+          if (row === undefined) return yield* Effect.die(`expected persisted message ${resolution.messageID}`)
+          const actual = result.messages.find((message) => message.info.id === storedMessageID(resolution.messageID))
+          if (actual === undefined) return yield* Effect.die(`expected loaded message ${resolution.messageID}`)
+          expect(actual.info as unknown).toEqual(
+            Schema.decodeUnknownSync(SessionV1.Info)({
+              ...row.data,
+              id: storedMessageID(row.id),
+              sessionID: row.session_id,
+            }),
+          )
+          expect(actual.info).toMatchObject({
+            role: "user",
+            model: item.content.message.model,
+            agent: item.content.message.agent,
+            summary: { title: "original title", body: "original body", diffs: expectedDiffs },
+          })
+          const partRows = updated.parts.filter((part) => part.message_id === row.id)
+          expect(actual.parts as unknown).toEqual(
+            partRows.map((part) =>
+              Schema.decodeUnknownSync(SessionV1.Part)({
+                ...part.data,
+                id: SessionV1.PartID.make(part.id),
+                sessionID: part.session_id,
+                messageID: SessionV1.MessageID.make(part.message_id),
+              }),
+            ),
+          )
+          const synthetic = actual.parts.find((part) => part.type === "text" && part.synthetic === true)
+          if (synthetic === undefined || synthetic.type !== "text") {
+            return yield* Effect.die(`expected a synthetic text part on ${resolution.messageID}`)
+          }
+          expect(synthetic.text).toBe(renderResult(resolution))
+          expect(synthetic.metadata).toMatchObject({ delegation: item.prepared.envelope.provenance })
+        }
+
+        const repeated = yield* delegation.history(parentID, [])
+        expect(repeated.messages).toEqual(result.messages)
+        expect(repeated.incoming.map((resolution) => resolution.id)).toEqual(
+          result.incoming.map((resolution) => resolution.id),
+        )
+        expect(yield* projection(db)).toEqual(updated)
+        return result
+      })
+
+    // The frozen content summary loads unchanged.
+    yield* loadExpectations(originalSummary.diffs, originalSummary.diffs)
+    const afterFirstAdmitted = yield* core.getResolution(admitted.resolution.id)
+    const afterFirstConsumed = yield* core.getResolution(consumed.resolution.id)
+    if (afterFirstAdmitted === undefined || afterFirstConsumed === undefined) {
+      return yield* Effect.die("expected resolutions after first history")
+    }
+    expect(resolutionState(afterFirstAdmitted)).toEqual(resolutionState(beforeAdmitted))
+    expect(resolutionState(afterFirstConsumed)).toEqual(resolutionState(beforeConsumed))
+
+    // SessionSummary writes back through MessageUpdated: data is replaced with the
+    // full canonical info minus id/sessionID, so only summary.diffs may differ.
+    const replacedDiffs = [
+      { file: "b.txt", patch: "--- a/b.txt\n+++ b/b.txt\n", additions: 2, deletions: 3, status: "added" as const },
+    ]
+    yield* applyMessageSummary(db, admitted.resolution.messageID, {
+      title: "original title",
+      body: "original body",
+      diffs: replacedDiffs,
+    })
+    yield* applyMessageSummary(db, consumed.resolution.messageID, {
+      title: "original title",
+      body: "original body",
+      diffs: [],
+    })
+
+    const result = yield* loadExpectations(replacedDiffs, [])
+    const consumedActual = result.messages.find((message) => message.info.id === storedMessageID(consumed.resolution.messageID))
+    if (consumedActual === undefined) return yield* Effect.die("expected loaded consumed message")
+    expect(consumedActual.info).toMatchObject({
+      summary: { title: "original title", body: "original body", diffs: [] },
+    })
+
+    const afterAdmitted = yield* core.getResolution(admitted.resolution.id)
+    const afterConsumed = yield* core.getResolution(consumed.resolution.id)
+    if (afterAdmitted === undefined || afterConsumed === undefined) {
+      return yield* Effect.die("expected resolutions after history")
+    }
+    expect(resolutionState(afterAdmitted)).toEqual(resolutionState(beforeAdmitted))
+    expect(resolutionState(afterConsumed)).toEqual(resolutionState(beforeConsumed))
+  }),
+)
+
+it.effect("loads canonical returns whose persisted user summary gained diffs", () =>
+  Effect.gen(function* () {
+    const parentID = sessionID("summary-gained-parent")
+    const admittedChildID = sessionID("summary-gained-admitted-child")
+    const consumedChildID = sessionID("summary-gained-consumed-child")
+    const { db, core, delegation } = yield* setup(
+      { id: parentID },
+      { id: admittedChildID, parentID },
+      { id: consumedChildID, parentID },
+    )
+    const admitted = yield* registerResolution(core, "summary-gained-admitted", parentID, admittedChildID)
+    const consumed = yield* registerResolution(core, "summary-gained-consumed", parentID, consumedChildID)
+    const admittedPrepared = yield* persistPreparedProjection(
+      db,
+      core,
+      admitted.resolution,
+      "summary-gained-admitted-agent",
+      model("summary-gained-admitted-provider", "summary-gained-admitted-model", "summary-gained-admitted-variant"),
+    )
+    yield* core.admit(admittedPrepared.prepared.id, SessionDelegation.receive)
+    const consumedPrepared = yield* persistPreparedProjection(
+      db,
+      core,
+      consumed.resolution,
+      "summary-gained-consumed-agent",
+      model("summary-gained-consumed-provider", "summary-gained-consumed-model", "summary-gained-consumed-variant"),
+    )
+    yield* core.admit(consumedPrepared.prepared.id, SessionDelegation.receive)
+    yield* core.markConsumed({ parentID, ids: [consumed.resolution.id] })
+    const beforeAdmitted = yield* core.getResolution(admitted.resolution.id)
+    const beforeConsumed = yield* core.getResolution(consumed.resolution.id)
+    if (beforeAdmitted === undefined || beforeConsumed === undefined) {
+      return yield* Effect.die("expected resolutions before history")
+    }
+
+    // SessionSummary writes back through MessageUpdated: data is replaced with the
+    // full canonical info minus id/sessionID, so the frozen envelope without a
+    // summary gains one whose only changing member is diffs.
+    const validDiffs = [
+      { file: "a.txt", patch: "--- a/a.txt\n+++ b/a.txt\n", additions: 1, deletions: 0, status: "modified" as const },
+    ]
+    yield* applyMessageSummary(db, admitted.resolution.messageID, { diffs: validDiffs })
+    yield* applyMessageSummary(db, consumed.resolution.messageID, { diffs: [] })
+    const updated = yield* projection(db)
+
+    const result = yield* delegation.history(parentID, [])
+    expect(result.incoming.map((resolution) => resolution.id)).toEqual([
+      admitted.resolution.id,
+      consumed.resolution.id,
+    ])
+    expect(result.messages.map((message) => message.info.id)).toEqual(
+      [admitted.resolution, consumed.resolution].map((resolution) => storedMessageID(resolution.messageID)),
+    )
+
+    for (const [resolution, item, diffs] of [
+      [admitted.resolution, admittedPrepared, validDiffs],
+      [consumed.resolution, consumedPrepared, []],
+    ] as const) {
+      const row = updated.messages.find((message) => message.id === storedMessageID(resolution.messageID))
+      if (row === undefined) return yield* Effect.die(`expected persisted message ${resolution.messageID}`)
+      const actual = result.messages.find((message) => message.info.id === storedMessageID(resolution.messageID))
+      if (actual === undefined) return yield* Effect.die(`expected loaded message ${resolution.messageID}`)
+      expect(actual.info as unknown).toEqual(
+        Schema.decodeUnknownSync(SessionV1.Info)({
+          ...row.data,
+          id: storedMessageID(row.id),
+          sessionID: row.session_id,
+        }),
+      )
+      expect(actual.info).toMatchObject({
+        role: "user",
+        model: item.content.message.model,
+        agent: item.content.message.agent,
+        summary: { diffs },
+      })
+      const partRows = updated.parts.filter((part) => part.message_id === row.id)
+      expect(actual.parts as unknown).toEqual(
+        partRows.map((part) =>
+          Schema.decodeUnknownSync(SessionV1.Part)({
+            ...part.data,
+            id: SessionV1.PartID.make(part.id),
+            sessionID: part.session_id,
+            messageID: SessionV1.MessageID.make(part.message_id),
+          }),
+        ),
+      )
+      const synthetic = actual.parts.find((part) => part.type === "text" && part.synthetic === true)
+      if (synthetic === undefined || synthetic.type !== "text") {
+        return yield* Effect.die(`expected a synthetic text part on ${resolution.messageID}`)
+      }
+      expect(synthetic.text).toBe(renderResult(resolution))
+      expect(synthetic.metadata).toMatchObject({ delegation: item.prepared.envelope.provenance })
+    }
+
+    const again = yield* delegation.history(parentID, [])
+    expect(again.messages).toEqual(result.messages)
+    expect(again.incoming.map((resolution) => resolution.id)).toEqual(
+      result.incoming.map((resolution) => resolution.id),
+    )
+    expect(yield* projection(db)).toEqual(updated)
+    const afterAdmitted = yield* core.getResolution(admitted.resolution.id)
+    const afterConsumed = yield* core.getResolution(consumed.resolution.id)
+    if (afterAdmitted === undefined || afterConsumed === undefined) {
+      return yield* Effect.die("expected resolutions after history")
+    }
+    expect(resolutionState(afterAdmitted)).toEqual(resolutionState(beforeAdmitted))
+    expect(resolutionState(afterConsumed)).toEqual(resolutionState(beforeConsumed))
+  }),
+)
+
+it.effect("rejects canonical returns whose persisted summary or identity drifted", () =>
+  Effect.gen(function* () {
+    const parentID = sessionID("summary-drift-parent")
+    const otherParentID = sessionID("summary-drift-other-parent")
+    const childID = sessionID("summary-drift-child")
+    const secondParentID = sessionID("summary-drift-second-parent")
+    const secondChildID = sessionID("summary-drift-second-child")
+    const { db, core, delegation } = yield* setup(
+      { id: parentID },
+      { id: otherParentID },
+      { id: childID, parentID },
+      { id: secondParentID },
+      { id: secondChildID, parentID: secondParentID },
+    )
+    const created = yield* registerResolution(core, "summary-drift", parentID, childID)
+    const { content, prepared } = yield* persistSummaryProjection(
+      db,
+      core,
+      created.resolution,
+      "summary-drift-agent",
+      model("summary-drift-provider", "summary-drift-model", "summary-drift-variant"),
+    )
+    yield* core.admit(prepared.id, SessionDelegation.receive)
+
+    const messageID = storedMessageID(created.resolution.messageID)
+    const originalMessage = yield* db.select().from(MessageTable).where(eq(MessageTable.id, messageID)).get()
+    if (originalMessage === undefined) return yield* Effect.die("expected a persisted delegation message")
+    const first = prepared.envelope.parts[0]
+    if (first === undefined) return yield* Effect.die("expected a synthetic prepared part")
+    const originalPart = yield* db.select().from(PartTable).where(eq(PartTable.id, storedPartID(first.id))).get()
+    if (originalPart === undefined) return yield* Effect.die("expected a persisted delegation part")
+    const originalData = originalMessage.data
+    const originalModel = content.message.model
+    // Simulates a drifted persisted row; intentionally ill-typed data.
+    const drift = (data: object) => data as unknown as typeof originalData
+
+    const expectHistoryConflict = Effect.gen(function* () {
+      const failed = yield* delegation.history(parentID, []).pipe(Effect.exit)
+      expectFailureCode(failed, "receiver_conflict")
+      expect((yield* core.getResolution(created.resolution.id))?.status).toBe("admitted")
+    })
+
+    const summaryDiffs = originalSummary.diffs
+    const messageCases: readonly (readonly [string, typeof originalData])[] = [
+      ["summary title changes", drift({ ...originalData, summary: { ...originalSummary, title: "drifted" } })],
+      [
+        "summary title is removed",
+        drift({ ...originalData, summary: { body: originalSummary.body, diffs: summaryDiffs } }),
+      ],
+      ["summary body changes", drift({ ...originalData, summary: { ...originalSummary, body: "drifted" } })],
+      [
+        "summary body is removed",
+        drift({ ...originalData, summary: { title: originalSummary.title, diffs: summaryDiffs } }),
+      ],
+      ["summary is removed", drift({ ...originalData, summary: undefined })],
+      [
+        "required diffs are missing",
+        drift({ ...originalData, summary: { title: originalSummary.title, body: originalSummary.body } }),
+      ],
+      [
+        "summary gains an unknown key",
+        drift({ ...originalData, summary: { ...originalSummary, unexpected: true } }),
+      ],
+      ["summary diffs are not an array", drift({ ...originalData, summary: { ...originalSummary, diffs: "drifted" } })],
+      [
+        "summary diff entry has an invalid additions with all other valid fields",
+        drift({
+          ...originalData,
+          summary: {
+            ...originalSummary,
+            diffs: [{ file: "a.txt", patch: "--- a/a.txt\n", additions: "many", deletions: 0, status: "modified" }],
+          },
+        }),
+      ],
+      [
+        "summary diff entry has an invalid status",
+        drift({ ...originalData, summary: { ...originalSummary, diffs: [{ ...summaryDiffs[0], status: "renamed" }] } }),
+      ],
+      [
+        "summary diff entry has an unknown key",
+        drift({ ...originalData, summary: { ...originalSummary, diffs: [{ ...summaryDiffs[0], unexpected: true }] } }),
+      ],
+      ["model drifts", drift({ ...originalData, model: { ...originalModel, providerID: "changed-provider" } })],
+      ["agent drifts", drift({ ...originalData, agent: "changed-agent" })],
+      ["message embeds an identity key", drift({ ...originalData, id: created.resolution.messageID })],
+    ]
+    for (const [name, data] of messageCases) {
+      yield* db.update(MessageTable).set({ data }).where(eq(MessageTable.id, messageID)).run().pipe(Effect.orDie)
+      yield* expectHistoryConflict
+      yield* db
+        .update(MessageTable)
+        .set({ data: originalData })
+        .where(eq(MessageTable.id, messageID))
+        .run()
+        .pipe(Effect.orDie)
+    }
+
+    const partCases: readonly (readonly [string, typeof originalPart.data])[] = [
+      ["synthetic part text drifts", syntheticPartData(created.resolution, "drifted-text")],
+      [
+        "synthetic part provenance drifts",
+        syntheticPartDataWithProvenance(created.resolution, { ...prepared.envelope.provenance, historyCutoff: "x" }),
+      ],
+    ]
+    for (const [name, data] of partCases) {
+      yield* db
+        .update(PartTable)
+        .set({ data })
+        .where(eq(PartTable.id, storedPartID(first.id)))
+        .run()
+        .pipe(Effect.orDie)
+      yield* expectHistoryConflict
+      yield* db
+        .update(PartTable)
+        .set({ data: originalPart.data })
+        .where(eq(PartTable.id, storedPartID(first.id)))
+        .run()
+        .pipe(Effect.orDie)
+    }
+
+    for (const [column, value] of [
+      ["session_id", otherParentID],
+      ["time_created", created.resolution.timeCreated + 1],
+    ] as const) {
+      yield* db
+        .update(MessageTable)
+        .set({ [column]: value })
+        .where(eq(MessageTable.id, messageID))
+        .run()
+        .pipe(Effect.orDie)
+      yield* expectHistoryConflict
+      yield* db
+        .update(MessageTable)
+        .set({ [column]: column === "session_id" ? parentID : created.resolution.timeCreated })
+        .where(eq(MessageTable.id, messageID))
+        .run()
+        .pipe(Effect.orDie)
+    }
+
+    // With the first parent's summary drifted, a clean second session still
+    // loads its own admitted return.
+    yield* db
+      .update(MessageTable)
+      .set({ data: drift({ ...originalData, summary: { ...originalSummary, title: "drifted" } }) })
+      .where(eq(MessageTable.id, messageID))
+      .run()
+      .pipe(Effect.orDie)
+    const second = yield* registerResolution(core, "summary-drift-second", secondParentID, secondChildID)
+    const secondPrepared = yield* persistPreparedProjection(
+      db,
+      core,
+      second.resolution,
+      "summary-drift-second-agent",
+      model("summary-drift-second-provider", "summary-drift-second-model"),
+    )
+    yield* core.admit(secondPrepared.prepared.id, SessionDelegation.receive)
+    const secondResult = yield* delegation.history(secondParentID, [])
+    expect(secondResult.incoming.map((resolution) => resolution.id)).toEqual([second.resolution.id])
+    expect(secondResult.messages.map((message) => message.info.id)).toEqual([storedMessageID(second.resolution.messageID)])
+
+    const failed = yield* delegation.history(parentID, []).pipe(Effect.exit)
+    expectFailureCode(failed, "receiver_conflict")
   }),
 )
