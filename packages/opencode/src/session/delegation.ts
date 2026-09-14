@@ -2,7 +2,7 @@ export * as SessionDelegation from "./delegation"
 
 import { Buffer } from "node:buffer"
 import { and, asc, desc, eq, inArray, or } from "drizzle-orm"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer, Option, Schema } from "effect"
 import type { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import type { SqlError } from "effect/unstable/sql/SqlError"
 import { DelegationStore } from "@opencode-ai/core/delegation"
@@ -1079,10 +1079,12 @@ function load(
     const message = messageByID.get(expected.messageID)
     if (message === undefined)
       return yield* fail("message_missing", `Delegation message ${expected.messageID} was not persisted`)
+    const expectedData = canonicalUserMessageData(message.data, expected.messageData)
     if (
       message.session_id !== expected.info.sessionID ||
       message.time_created !== expected.info.time.created ||
-      !sameJson(message.data, expected.messageData) ||
+      expectedData === undefined ||
+      !sameJson(message.data, expectedData) ||
       identityKey(message.data, ["id", "sessionID"]) !== undefined
     ) {
       return yield* fail("receiver_conflict", `Persisted delegation message ${expected.messageID} is not canonical`)
@@ -1146,6 +1148,25 @@ function mutableUser(info: Schema.Schema.Type<typeof SessionV1.User>): SessionV1
             diffs: summary.diffs.map((diff) => ({ ...diff })),
           },
         }),
+  }
+}
+
+// SessionSummary derives diffs after a canonical return has been delivered, so the
+// persisted user message may gain summary.diffs relative to the delivered envelope.
+// The delivery contract is otherwise frozen: only a schema-valid summary that survives
+// decoded-vs-raw equality is tolerated (addition only — a summary can never be removed),
+// and every other raw field plus the expected summary properties must match exactly.
+function canonicalUserMessageData(actual: unknown, expected: Record<string, unknown>) {
+  if (!isRecord(actual) || sameJson(actual, expected)) return expected
+  const { summary: actualSummary, ...actualRest } = actual
+  const { summary: expectedSummary, ...expectedRest } = expected
+  if (!sameJson(actualRest, expectedRest) || actualSummary === undefined) return undefined
+  const decodeSummary = Schema.decodeUnknownOption(SessionV1.User.fields.summary.schema)
+  const validated = Option.getOrUndefined(decodeSummary(actualSummary))
+  if (validated === undefined || !sameJson(validated, actualSummary)) return undefined
+  return {
+    ...expectedRest,
+    summary: { ...(isRecord(expectedSummary) ? expectedSummary : {}), diffs: validated.diffs },
   }
 }
 
